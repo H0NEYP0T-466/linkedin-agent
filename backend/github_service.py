@@ -117,7 +117,7 @@ def clone_repo(repo: dict[str, Any], log_callback=None) -> bool:
     if log_callback:
         log_callback(f"[github] Cloning {repo_name}...")
     # Attempt clone, falling back to --depth=1 on network/index-pack errors
-    for attempt, depth in enumerate((1)):
+    for attempt, depth in enumerate([100, 1]):
         # Remove any leftover partial clone directory before each attempt
         if target_dir.exists():
             _rmtree_force(target_dir)
