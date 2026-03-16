@@ -1,9 +1,12 @@
 """LLM service using LongCat OpenAI-format API."""
 
+import logging
 import os
 from typing import Any
 
 import httpx
+
+logger = logging.getLogger(__name__)
 
 LLM_MODEL = os.getenv("LLM_MODEL", "longcat-flash-lite")
 LONGCAT_BASE_URL = os.getenv("LONGCAT_BASE_URL", "https://api.longcat.chat/openai").rstrip("/")
@@ -13,9 +16,13 @@ REQUEST_TIMEOUT = float(os.getenv("LLM_TIMEOUT_SECONDS", "60"))
 
 def get_request_headers() -> dict[str, str]:
     if not LONGCAT_API_KEY:
-        raise ValueError(
-            "LONGCAT_API_KEY (or OPENAI_API_KEY) is not set. Please set it in your .env file."
+        msg = (
+            "LLM API key is NOT configured. "
+            "Set LONGCAT_API_KEY (or OPENAI_API_KEY) in your .env file. "
+            "All LLM-dependent features will fail until this is fixed."
         )
+        logger.error(msg)
+        raise ValueError(msg)
     return {
         "Authorization": f"Bearer {LONGCAT_API_KEY}",
         "Content-Type": "application/json",
@@ -30,16 +37,27 @@ async def generate_text(prompt: str, temperature: float = 0.7) -> str:
         "temperature": temperature,
     }
     async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
-        response = await client.post(
-            f"{LONGCAT_BASE_URL}/chat/completions",
-            headers=get_request_headers(),
-            json=payload,
-        )
-        response.raise_for_status()
+        try:
+            response = await client.post(
+                f"{LONGCAT_BASE_URL}/chat/completions",
+                headers=get_request_headers(),
+                json=payload,
+            )
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            logger.error(
+                "LLM API HTTP error %s for model '%s': %s",
+                exc.response.status_code, LLM_MODEL, exc.response.text[:300],
+            )
+            raise
+        except httpx.RequestError as exc:
+            logger.error("LLM API connection error: %s", exc)
+            raise
 
     data = response.json()
     content = ((data.get("choices") or [{}])[0].get("message") or {}).get("content", "")
     if not content:
+        logger.error("LLM returned an empty completion. Full response: %s", data)
         raise ValueError("LongCat returned an empty completion response.")
     return content.strip()
 
@@ -190,3 +208,22 @@ Activity: {summary}
 Answer only "yes" or "no"."""
     answer = await generate_text(prompt, temperature=0.1)
     return answer.strip().lower().startswith("y")
+
+
+async def chat_response(user_message: str, context: str = "") -> str:
+    """Generate a friendly conversational reply to a user message."""
+    system_note = (
+        "You are a friendly AI assistant embedded in a LinkedIn content agent. "
+        "You help the owner manage their LinkedIn posts and GitHub repos. "
+        "Be concise, helpful, and conversational. "
+        "If the user seems to be asking about the agent or their repos/posts, give a relevant helpful answer. "
+        "Keep replies under 200 words."
+    )
+    ctx_block = f"\n\nAgent context:\n{context[:600]}" if context else ""
+    prompt = f"""{system_note}{ctx_block}
+
+User message: {user_message}
+
+Reply:"""
+    return await generate_text(prompt, temperature=0.7)
+

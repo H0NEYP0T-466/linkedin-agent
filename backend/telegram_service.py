@@ -9,9 +9,17 @@ from typing import Any
 from telegram import Bot, Update
 from telegram.error import TelegramError
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram.request import HTTPXRequest
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+# Proxy URL for regions where Telegram is blocked (e.g. socks5://user:pass@host:port
+# or https://user:pass@host:port).  Can also be set via the standard HTTPS_PROXY env var.
+TELEGRAM_PROXY = (
+    os.getenv("TELEGRAM_PROXY", "")
+    or os.getenv("HTTPS_PROXY", "")
+    or os.getenv("https_proxy", "")
+)
 TELEGRAM_MESSAGE_CHUNK_SIZE = 4000
 
 logger = logging.getLogger(__name__)
@@ -28,6 +36,14 @@ def set_message_callback(cb: Callable[[str], Coroutine]) -> None:
     _message_callback = cb
 
 
+def _make_request() -> HTTPXRequest | None:
+    """Build an HTTPXRequest with proxy configured, or None for default."""
+    if TELEGRAM_PROXY:
+        logger.info("Telegram: using proxy %s", TELEGRAM_PROXY)
+        return HTTPXRequest(proxy=TELEGRAM_PROXY)
+    return None
+
+
 async def send_message(text: str, chat_id: str | None = None) -> bool:
     """Send a plain text message to the configured chat."""
     if not TELEGRAM_BOT_TOKEN:
@@ -38,13 +54,14 @@ async def send_message(text: str, chat_id: str | None = None) -> bool:
         logger.warning("TELEGRAM_CHAT_ID not set, skipping Telegram message.")
         return False
     try:
-        bot = Bot(token=TELEGRAM_BOT_TOKEN)
+        req = _make_request()
+        bot = Bot(token=TELEGRAM_BOT_TOKEN, request=req) if req else Bot(token=TELEGRAM_BOT_TOKEN)
         # Telegram max message length is 4096
         for chunk in _split_text(text, TELEGRAM_MESSAGE_CHUNK_SIZE):
             await bot.send_message(chat_id=target, text=chunk, parse_mode="Markdown")
         return True
     except TelegramError as exc:
-        logger.error(f"Telegram send error: {exc}")
+        logger.error("Telegram send error: %s", exc)
         return False
 
 
@@ -59,7 +76,8 @@ async def send_post_for_review(post_content: str, context: str = "") -> None:
         "✅ `approve` - Post is good\n"
         "❌ `reject` - Skip this post\n"
         "✏️ `improve: <feedback>` - Request changes\n"
-        "🔁 `regenerate` - Generate a new version"
+        "🔁 `regenerate` - Generate a new version\n\n"
+        "💡 _Tip: You can also attach an image/photo to include with this post on LinkedIn._"
     )
     await send_message(body)
 
@@ -162,7 +180,11 @@ async def start_bot(message_callback: Callable[[str], Coroutine] | None = None) 
     if message_callback:
         set_message_callback(message_callback)
 
-    _bot_app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+    builder = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN)
+    if TELEGRAM_PROXY:
+        builder = builder.proxy(TELEGRAM_PROXY).get_updates_proxy(TELEGRAM_PROXY)
+
+    _bot_app = builder.build()
     _bot_app.add_handler(CommandHandler("start", _handle_start))
     _bot_app.add_handler(CommandHandler("status", _handle_status))
     _bot_app.add_handler(CommandHandler("todo", _handle_todo))
