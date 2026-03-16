@@ -176,6 +176,59 @@ Write only the post content, nothing else."""
     return await generate_text(prompt, temperature=0.8)
 
 
+async def generate_commit_activity_post(
+    repo_name: str,
+    repo_info: dict[str, Any],
+    file_path: str,
+    file_content: str,
+    activity_summary: str,
+    memory_context: str = "",
+    repos_context: str = "",
+) -> str:
+    """Generate a LinkedIn post about a newly implemented feature in a repo.
+
+    The post should read as "I just implemented [functionality] in [repo]" style.
+    """
+    memory_note = ""
+    if memory_context:
+        memory_note = (
+            f"\n\nPrevious approved posts (for style reference — avoid repeating):\n"
+            f"{memory_context[:800]}"
+        )
+
+    repos_note = ""
+    if repos_context:
+        repos_note = f"\n\nYour repositories context:\n{repos_context[:800]}"
+
+    prompt = f"""You are a LinkedIn content creator for a software developer.
+I just pushed new code to my GitHub repository '{repo_name}'.
+Write an engaging LinkedIn post about this new functionality/feature I implemented.
+
+Repository: {repo_name}
+Language: {repo_info.get('language') or 'Unknown'}
+URL: {repo_info.get('html_url', '')}
+What changed (summary): {activity_summary}
+
+The file I worked on ({file_path}):
+```
+{file_content[:2500]}
+```
+{repos_note}{memory_note}
+
+Guidelines:
+- Write in first person as the developer
+- Frame it as "I just implemented / built / added [feature] in [repo]"
+- Explain what the new feature does and why it is useful or interesting
+- Be technical but accessible; highlight design decisions if visible in the code
+- Include 3-5 relevant hashtags at the end
+- 150-300 words
+- End with a call to action (check it out, feedback welcome, etc.)
+- Do NOT include placeholder text like [your name] or [link]
+
+Write only the post content, nothing else."""
+    return await generate_text(prompt, temperature=0.8)
+
+
 async def summarize_commit_activity(
     repo_name: str, commits: list[dict[str, Any]]
 ) -> str:
