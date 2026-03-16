@@ -495,9 +495,70 @@ async def post_from_news() -> None:
             await telegram_service.send_message("✅ Improved news post approved!")
 
 
+def _find_repo_in_text(text: str, repos: list[dict]) -> dict | None:
+    """Try to find a repo mentioned by name in free-form text."""
+    lower = text.lower()
+    # Sort by length descending so longer/more-specific names match first
+    for repo in sorted(repos, key=lambda r: len(r.get("name", "")), reverse=True):
+        name = repo.get("name", "")
+        if name and name.lower() in lower:
+            return repo
+    return None
+
+
+async def _run_post_review_loop(
+    post: str,
+    label: str,
+    context_str: str,
+    repo_name: str | None = None,
+) -> None:
+    """Send a post for Telegram review and handle approve/improve/reject."""
+    draft_path = storage.save_post_draft(post, label=label)
+    log(f"💾 Draft saved: {draft_path.name}")
+    await telegram_service.send_post_for_review(post, context_str)
+    decision = await telegram_service.get_user_decision(timeout=86400)
+    action = decision.get("action", "timeout")
+
+    if action == "approve":
+        approved_path = storage.save_approved_post(post, label=label)
+        log(f"💾 Approved post saved: {approved_path.name}")
+        storage.append_to_memory(post, repo_name)
+        await telegram_service.send_message("✅ Post approved and saved!")
+
+    elif action == "improve":
+        feedback = decision.get("feedback", "")
+        log(f"✏️  Improving post based on feedback: {feedback}")
+        await telegram_service.send_message("✏️ Applying feedback and regenerating...")
+        try:
+            improved = await llm_service.generate_text(
+                f"Improve this LinkedIn post based on feedback.\n\nOriginal post:\n{post}\n\n"
+                f"Feedback: {feedback}\n\nRewrite the post:"
+            )
+        except Exception as exc:
+            log(f"⚠️  Improve failed: {exc}")
+            improved = post
+        imp_draft = storage.save_post_draft(improved, label=f"{label}-improved")
+        log(f"💾 Improved draft saved: {imp_draft.name}")
+        await telegram_service.send_post_for_review(improved, f"{context_str} [IMPROVED]")
+        d2 = await telegram_service.get_user_decision(timeout=86400)
+        if d2.get("action") == "approve":
+            approved_path = storage.save_approved_post(improved, label=label)
+            log(f"💾 Approved improved post saved: {approved_path.name}")
+            storage.append_to_memory(improved, repo_name)
+            await telegram_service.send_message("✅ Improved post approved!")
+        else:
+            await telegram_service.send_message("⏭️ Post skipped.")
+
+    elif action in ("reject", "timeout"):
+        await telegram_service.send_message("⏭️ Post skipped.")
+
+
 async def handle_custom_command(text: str) -> None:
-    """Handle a custom request from the user via Telegram."""
-    log(f"💬 Custom command received: {text}")
+    """Handle a request from the user via Telegram."""
+    if text.startswith("/"):
+        log(f"💬 Command received: {text[:80]}")
+    else:
+        log(f"💬 Message from user: {text[:80]}")
 
     if text.startswith("/status"):
         todo = storage.load_todo()
@@ -505,38 +566,153 @@ async def handle_custom_command(text: str) -> None:
         done = [t for t in todo if t.get("status") == "done"]
         state = storage.get_state()
         repos = storage.get_repos_data()
+        last_posted = storage.get_last_posted_date()
         msg = (
             f"📊 *Agent Status*\n\n"
             f"✅ Initialized: {state.get('initialized', False)}\n"
             f"📦 Repos: {len(repos)}\n"
             f"📋 Pending tasks: {len(pending)}\n"
             f"✅ Done tasks: {len(done)}\n"
+            f"📅 Last post date: {last_posted or 'never'}\n"
         )
         await telegram_service.send_message(msg)
 
     elif text.startswith("/todo"):
-        todo = storage.load_todo()
-        pending = [t for t in todo if t.get("status") == "pending"][:10]
-        if not pending:
-            await telegram_service.send_message("📋 No pending tasks!")
+        args = text[5:].strip()
+
+        if args.startswith("add "):
+            task = args[4:].strip()
+            if task:
+                storage.add_todo(task, task_type="custom")
+                await telegram_service.send_message(f"✅ Added task: _{task}_")
+                log(f"📋 Todo added: {task}")
+            else:
+                await telegram_service.send_message("Usage: `/todo add <task description>`")
+
+        elif args.startswith("done "):
+            id_str = args[5:].strip()
+            try:
+                task_id = int(id_str)
+                storage.complete_todo(task_id)
+                await telegram_service.send_message(f"✅ Marked task #{task_id} as done!")
+                log(f"📋 Todo #{task_id} completed.")
+            except ValueError:
+                await telegram_service.send_message(
+                    f"❌ Invalid task ID: `{id_str}`\nUsage: `/todo done <id>`"
+                )
+
         else:
-            lines = [f"📋 *Pending Tasks ({len(pending)})*\n"]
-            for t in pending:
-                lines.append(f"• [{t['type']}] {t['task'][:80]}")
-            await telegram_service.send_message("\n".join(lines))
+            todo = storage.load_todo()
+            pending = [t for t in todo if t.get("status") == "pending"][:10]
+            if not pending:
+                await telegram_service.send_message("📋 No pending tasks!")
+            else:
+                lines = [f"📋 *Pending Tasks ({len(pending)})*\n"]
+                for t in pending:
+                    lines.append(f"• `#{t['id']}` [{t['type']}] {t['task'][:80]}")
+                lines.append("\n_Use /todo done <id> to complete a task_")
+                lines.append("_Use /todo add <task> to add a task_")
+                await telegram_service.send_message("\n".join(lines))
 
     elif text.startswith("/repos"):
         repos_md = storage.read_repos_md()
         if repos_md:
             await telegram_service.send_message(f"📦 *Repositories*\n\n{repos_md[:3000]}")
         else:
-            await telegram_service.send_message("No repos data yet.")
+            await telegram_service.send_message(
+                "No repos data yet. The agent will sync repos on the next startup."
+            )
 
-    elif text.startswith("/post "):
-        topic = text[6:].strip()
-        if not topic:
-            await telegram_service.send_message("Usage: /post <topic>")
+    elif text.startswith("/memory"):
+        memory = storage.read_memory()
+        if memory:
+            await telegram_service.send_message(f"🧠 *Post Memory*\n\n{memory[:3500]}")
+        else:
+            await telegram_service.send_message(
+                "📭 Memory is empty — no posts have been approved yet."
+            )
+
+    elif text.startswith("/readme"):
+        repo_name = text[7:].strip()
+        if not repo_name:
+            await telegram_service.send_message(
+                "Usage: `/readme <repo-name>`\nUse /repos to see available repos."
+            )
             return
+        readme = github_service.get_repo_readme(repo_name)
+        if readme:
+            await telegram_service.send_message(
+                f"📄 *README: {repo_name}*\n\n{readme[:3500]}"
+            )
+        else:
+            repos = storage.get_repos_data()
+            known = [r.get("name", "") for r in repos]
+            if repo_name in known:
+                await telegram_service.send_message(
+                    f"⚠️ I have `{repo_name}` in my list but its README hasn't been "
+                    "fetched yet. The agent will fetch it on the next sync."
+                )
+            else:
+                await telegram_service.send_message(
+                    f"❌ I don't have any data for `{repo_name}`.\n\n"
+                    "Use /repos to see all tracked repositories."
+                )
+
+    elif text.startswith("/pending"):
+        posts = sorted(storage.POSTS_DIR.glob("*.txt"))
+        if not posts:
+            await telegram_service.send_message("📭 No pending draft posts.")
+            return
+        lines = [f"📝 *Pending Drafts ({len(posts)} total)*\n"]
+        for p in posts[:5]:
+            snippet = p.read_text(encoding="utf-8")[:120].replace("\n", " ")
+            lines.append(f"📄 *{p.name}*\n_{snippet}_\n")
+        if len(posts) > 5:
+            lines.append(f"_...and {len(posts) - 5} more._")
+        await telegram_service.send_message("\n".join(lines))
+
+    elif text.startswith("/post"):
+        topic = text[5:].strip()
+        if not topic:
+            await telegram_service.send_message(
+                "Usage:\n"
+                "• `/post <topic>` — draft a post on any topic\n"
+                "• `/post repo:<name>` — draft a post for a specific repo"
+            )
+            return
+
+        # Repo-specific post: /post repo:<name>
+        if topic.lower().startswith("repo:"):
+            repo_name = topic[5:].strip()
+            repos = storage.get_repos_data()
+            repo = next(
+                (r for r in repos if r.get("name", "").lower() == repo_name.lower()), None
+            )
+            if not repo:
+                await telegram_service.send_message(
+                    f"❌ I don't have data for repo `{repo_name}`.\n\n"
+                    "Use /repos to see all tracked repositories."
+                )
+                return
+            log(f"✍️  Drafting repo post for: {repo_name}")
+            await telegram_service.send_message(
+                f"✍️ Drafting a LinkedIn post for repo `{repo_name}`..."
+            )
+            readme = github_service.get_repo_readme(repo_name)
+            description = repo.get("generated_description") or repo.get("description") or ""
+            memory_ctx = storage.read_memory()
+            try:
+                post = await llm_service.generate_linkedin_post(
+                    repo, description, readme, memory_ctx
+                )
+                label = "repo-" + _post_label(repo_name)
+                await _run_post_review_loop(post, label, f"Repo: {repo_name}", repo_name)
+            except Exception as exc:
+                log(f"❌ Repo post failed: {exc}")
+                await telegram_service.send_message(f"❌ Failed to generate post: {exc}")
+            return
+
+        # Custom topic post
         log(f"✍️  Drafting custom post on: {topic}")
         await telegram_service.send_message(f"✍️ Drafting a post on: _{topic}_...")
         repos_md = storage.read_repos_md()
@@ -544,56 +720,143 @@ async def handle_custom_command(text: str) -> None:
         try:
             post = await llm_service.generate_custom_post(topic, repos_md, memory_ctx)
             label = "custom-" + _post_label(topic)
-            draft_path = storage.save_post_draft(post, label=label)
-            log(f"💾 Custom draft saved: {draft_path.name}")
-            await telegram_service.send_post_for_review(post, f"Custom: {topic}")
-            decision = await telegram_service.get_user_decision(timeout=86400)
-            if decision.get("action") == "approve":
-                approved_path = storage.save_approved_post(post, label=label)
-                log(f"💾 Custom approved post saved: {approved_path.name}")
-                storage.append_to_memory(post)
-                await telegram_service.send_message("✅ Custom post approved!")
-            elif decision.get("action") == "improve":
-                feedback = decision.get("feedback", "")
-                improved = await llm_service.generate_text(
-                    f"Improve this post:\n{post}\n\nFeedback: {feedback}\n\nRewrite:"
-                )
-                imp_draft = storage.save_post_draft(improved, label=f"{label}-improved")
-                log(f"💾 Improved custom draft saved: {imp_draft.name}")
-                await telegram_service.send_post_for_review(improved, "[IMPROVED]")
-                d2 = await telegram_service.get_user_decision(timeout=86400)
-                if d2.get("action") == "approve":
-                    approved_path = storage.save_approved_post(improved, label=label)
-                    log(f"💾 Custom approved post saved: {approved_path.name}")
-                    storage.append_to_memory(improved)
-                    await telegram_service.send_message("✅ Improved post approved!")
+            await _run_post_review_loop(post, label, f"Custom: {topic}")
         except Exception as exc:
             log(f"❌ Custom post failed: {exc}")
             await telegram_service.send_message(f"❌ Failed to generate post: {exc}")
+
     elif text.startswith("/"):
         # Unknown slash command
         await telegram_service.send_message(
-            f"🤔 Unknown command: {text}\n\nTry:\n"
-            "/status, /todo, /repos, /post <topic>, or /skip"
+            f"🤔 Unknown command: `{text}`\n\nAvailable commands:\n"
+            "/status — agent status\n"
+            "/todo — pending tasks\n"
+            "/todo add <task> — add a task\n"
+            "/todo done <id> — complete a task\n"
+            "/post <topic> — draft a post\n"
+            "/post repo:<name> — draft a post for a specific repo\n"
+            "/repos — tracked repositories\n"
+            "/memory — post memory log\n"
+            "/readme <repo> — show a repo's README\n"
+            "/pending — pending draft posts\n"
+            "/skip — skip current task"
         )
+
     else:
-        # Casual / conversational message — respond as chatbot
-        log(f"💬 Casual message from user: {text[:80]}")
-        try:
-            state = storage.get_state()
-            repos = storage.get_repos_data()
-            context = (
-                f"Initialized: {state.get('initialized', False)}, "
-                f"Repos tracked: {len(repos)}"
-            )
-            reply = await llm_service.chat_response(text, context=context)
-            await telegram_service.send_message(reply)
-        except Exception as exc:
-            log(f"⚠️  Chatbot response failed: {exc}")
+        # Casual / conversational message
+        await _handle_casual_message(text)
+
+
+async def _handle_casual_message(text: str) -> None:
+    """Handle a casual/conversational message from the user with intent detection."""
+    lower = text.lower()
+
+    # Intent: show pending draft posts
+    if any(kw in lower for kw in ["pending post", "draft post", "unsent post", "posts pending"]):
+        posts = sorted(storage.POSTS_DIR.glob("*.txt"))
+        if not posts:
+            await telegram_service.send_message("📭 No pending draft posts at the moment.")
+        else:
+            lines = [f"📝 *Pending Drafts ({len(posts)} total)*\n"]
+            for p in posts[:5]:
+                snippet = p.read_text(encoding="utf-8")[:120].replace("\n", " ")
+                lines.append(f"📄 *{p.name}*\n_{snippet}_\n")
+            if len(posts) > 5:
+                lines.append(f"_...and {len(posts) - 5} more._")
+            await telegram_service.send_message("\n".join(lines))
+        return
+
+    # Intent: make / create / write a post (possibly for a specific repo)
+    post_intent_keywords = [
+        "make a post", "create a post", "write a post", "draft a post",
+        "post about", "post from", "generate a post", "make post",
+    ]
+    if any(kw in lower for kw in post_intent_keywords):
+        repos = storage.get_repos_data()
+        matched_repo = _find_repo_in_text(text, repos)
+        if matched_repo:
+            repo_name = matched_repo.get("name", "")
+            log(f"✍️  Drafting repo post (natural language request) for: {repo_name}")
             await telegram_service.send_message(
-                "Hey! 👋 I'm your LinkedIn Agent. I'm here to help manage your posts and repos.\n\n"
-                "Try: /status, /todo, /repos, /post <topic>"
+                f"✍️ Got it! Drafting a LinkedIn post for `{repo_name}`..."
             )
+            readme = github_service.get_repo_readme(repo_name)
+            description = (
+                matched_repo.get("generated_description")
+                or matched_repo.get("description")
+                or ""
+            )
+            memory_ctx = storage.read_memory()
+            try:
+                post = await llm_service.generate_linkedin_post(
+                    matched_repo, description, readme, memory_ctx
+                )
+                label = "repo-" + _post_label(repo_name)
+                await _run_post_review_loop(post, label, f"Repo: {repo_name}", repo_name)
+            except Exception as exc:
+                log(f"❌ Post generation failed: {exc}")
+                await telegram_service.send_message(f"❌ Failed to generate post: {exc}")
+        else:
+            # No specific repo identified — ask them to be more specific or use /post
+            await telegram_service.send_message(
+                "✍️ I'd be happy to draft a post! Please tell me which repo or topic:\n\n"
+                "• `/post <topic>` — post on any topic\n"
+                "• `/post repo:<name>` — post about a specific repo\n"
+                "• `/repos` — see all repos I know about"
+            )
+        return
+
+    # Intent: show repos / memory / todo via natural language
+    if any(kw in lower for kw in ["show repos", "list repos", "my repos", "tracked repos"]):
+        repos_md = storage.read_repos_md()
+        if repos_md:
+            await telegram_service.send_message(f"📦 *Repositories*\n\n{repos_md[:3000]}")
+        else:
+            await telegram_service.send_message("No repo data yet. Try /repos.")
+        return
+
+    if any(kw in lower for kw in ["show memory", "my memory", "past posts", "approved posts"]):
+        memory = storage.read_memory()
+        if memory:
+            await telegram_service.send_message(f"🧠 *Post Memory*\n\n{memory[:3500]}")
+        else:
+            await telegram_service.send_message("📭 Memory is empty — no posts approved yet.")
+        return
+
+    if any(kw in lower for kw in ["show todo", "my tasks", "pending tasks", "what's next"]):
+        todo = storage.load_todo()
+        pending = [t for t in todo if t.get("status") == "pending"][:10]
+        if not pending:
+            await telegram_service.send_message("📋 No pending tasks!")
+        else:
+            lines = [f"📋 *Pending Tasks ({len(pending)})*\n"]
+            for t in pending:
+                lines.append(f"• `#{t['id']}` [{t['type']}] {t['task'][:80]}")
+            await telegram_service.send_message("\n".join(lines))
+        return
+
+    # General conversational response via LLM with rich, truthful context
+    try:
+        state = storage.get_state()
+        repos = storage.get_repos_data()
+        todo = storage.load_todo()
+        pending_tasks = [t for t in todo if t.get("status") == "pending"]
+        repo_names = [r.get("name", "") for r in repos]
+
+        context = (
+            f"Initialized: {state.get('initialized', False)}. "
+            f"Repos tracked ({len(repos)}): {', '.join(repo_names[:15])}. "
+            f"Pending tasks: {len(pending_tasks)}. "
+            f"Last post date: {storage.get_last_posted_date() or 'never'}."
+        )
+        reply = await llm_service.chat_response(text, context=context)
+        await telegram_service.send_message(reply)
+    except Exception as exc:
+        log(f"⚠️  Chatbot response failed: {exc}")
+        await telegram_service.send_message(
+            "Hey! 👋 I'm your LinkedIn Agent. I'm here to help manage your posts and repos.\n\n"
+            "Try: /status, /todo, /repos, /post <topic>"
+        )
 
 
 # ── Agent entrypoint ──────────────────────────────────────────────────────────

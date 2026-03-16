@@ -184,9 +184,16 @@ async def _handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "Commands:\n"
         "/status - Agent status\n"
         "/todo - Show pending tasks\n"
-        "/post <topic> - Draft a post on a custom topic\n"
+        "/todo add <task> - Add a new task\n"
+        "/todo done <id> - Mark a task as done\n"
+        "/post <topic> - Draft a post on a topic\n"
+        "/post repo:<name> - Draft a post for a specific repo\n"
         "/repos - Show tracked repos\n"
-        "/skip - Skip current task",
+        "/memory - Show the post memory log\n"
+        "/readme <repo> - Show a repo's README\n"
+        "/pending - Show pending draft posts\n"
+        "/skip - Skip current task\n\n"
+        "💬 You can also just chat naturally!",
         parse_mode="Markdown",
     )
 
@@ -224,8 +231,10 @@ async def _handle_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 async def _handle_todo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    args = context.args or []
+    suffix = " " + " ".join(args) if args else ""
     if _message_callback:
-        await _message_callback("/todo")
+        await _message_callback(f"/todo{suffix}")
 
 
 async def _handle_post(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -238,6 +247,23 @@ async def _handle_post(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 async def _handle_repos(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if _message_callback:
         await _message_callback("/repos")
+
+
+async def _handle_memory(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if _message_callback:
+        await _message_callback("/memory")
+
+
+async def _handle_readme(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    args = context.args or []
+    repo_name = " ".join(args) if args else ""
+    if _message_callback:
+        await _message_callback(f"/readme {repo_name}")
+
+
+async def _handle_pending(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if _message_callback:
+        await _message_callback("/pending")
 
 
 async def _handle_skip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -262,6 +288,11 @@ async def _start_bot_inner(message_callback: Callable[[str], Coroutine] | None =
     """Internal helper: initialize and start the bot application."""
     global _bot_app
 
+    # Guard against starting a second bot instance while one is already running
+    if _bot_app is not None:
+        logger.warning("Telegram bot is already running; skipping duplicate startup.")
+        return
+
     if message_callback:
         set_message_callback(message_callback)
 
@@ -275,6 +306,9 @@ async def _start_bot_inner(message_callback: Callable[[str], Coroutine] | None =
     _bot_app.add_handler(CommandHandler("todo", _handle_todo))
     _bot_app.add_handler(CommandHandler("post", _handle_post))
     _bot_app.add_handler(CommandHandler("repos", _handle_repos))
+    _bot_app.add_handler(CommandHandler("memory", _handle_memory))
+    _bot_app.add_handler(CommandHandler("readme", _handle_readme))
+    _bot_app.add_handler(CommandHandler("pending", _handle_pending))
     _bot_app.add_handler(CommandHandler("skip", _handle_skip))
     _bot_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _handle_message))
 
