@@ -85,9 +85,8 @@ async def sync_repos_on_startup() -> None:
         for repo in new_repos:
             repo_name = repo.get("name", "")
             readme = github_service.get_repo_readme(repo_name)
-            file_tree = github_service.get_repo_file_tree(repo_name)
             try:
-                desc = await llm_service.generate_repo_description(repo, readme, file_tree)
+                desc = await llm_service.generate_repo_description(repo, readme)
             except Exception as exc:
                 log(f"⚠️  LLM description failed for {repo_name}: {exc}")
                 desc = repo.get("description") or "No description available."
@@ -141,11 +140,10 @@ async def first_run_setup() -> None:
         github_service.clone_repo(repo, log_callback=log)
 
         readme = github_service.get_repo_readme(repo_name)
-        file_tree = github_service.get_repo_file_tree(repo_name)
 
         log(f"[{i}/{len(repos)}] Generating description for {repo_name}...")
         try:
-            description = await llm_service.generate_repo_description(repo, readme, file_tree)
+            description = await llm_service.generate_repo_description(repo, readme)
         except Exception as exc:
             log(f"⚠️  LLM error for {repo_name}: {exc}")
             description = repo.get("description") or "No description available."
@@ -570,8 +568,8 @@ async def run_agent() -> None:
     # Register Telegram message callback
     telegram_service.set_message_callback(handle_custom_command)
 
-    # Start Telegram bot
-    log("📱 Starting Telegram bot...")
+    # Start Telegram bot in background (non-blocking — agent continues immediately)
+    log("📱 Starting Telegram bot in background...")
     await telegram_service.start_bot(message_callback=handle_custom_command)
 
     # First-run initialization

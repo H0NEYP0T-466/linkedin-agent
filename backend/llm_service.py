@@ -62,8 +62,8 @@ async def generate_text(prompt: str, temperature: float = 0.7) -> str:
     return content.strip()
 
 
-async def generate_repo_description(repo: dict[str, Any], readme: str, file_tree: str) -> str:
-    """Generate a short description of a GitHub repo."""
+async def generate_repo_description(repo: dict[str, Any], readme: str) -> str:
+    """Generate a short description of a GitHub repo using its README."""
     prompt = f"""You are a technical writer. Based on the repository information below, 
 write a concise 2-3 sentence description of what this project does.
 
@@ -73,11 +73,8 @@ Primary language: {repo.get('language') or 'Unknown'}
 Topics: {', '.join(repo.get('topics', []))}
 Stars: {repo.get('stargazers_count', 0)}
 
-README (first 2000 chars):
-{readme[:2000] if readme else 'Not available'}
-
-File tree:
-{file_tree[:500] if file_tree else 'Not available'}
+README (first 3000 chars):
+{readme[:3000] if readme else 'Not available'}
 
 Write only the description, no headers or labels."""
     return await generate_text(prompt, temperature=0.4)
