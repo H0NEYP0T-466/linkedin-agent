@@ -62,7 +62,7 @@ def write_repos_md(repos: list[dict[str, Any]]) -> None:
     lines = ["# Repositories\n\n"]
     for repo in repos:
         name = repo.get("name", "")
-        description = repo.get("description") or "No description"
+        description = repo.get("generated_description") or repo.get("description") or "No description"
         language = repo.get("language") or "Unknown"
         url = repo.get("html_url", "")
         topics = ", ".join(repo.get("topics", []))

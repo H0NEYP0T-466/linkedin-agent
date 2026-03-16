@@ -116,24 +116,39 @@ def clone_repo(repo: dict[str, Any], log_callback=None) -> bool:
 
     if log_callback:
         log_callback(f"[github] Cloning {repo_name}...")
-    try:
-        result = subprocess.run(
-            ["git", "clone", f"--depth={CLONE_DEPTH}", clone_url, str(target_dir)],
-            capture_output=True, text=True, timeout=300,
-        )
-        if result.returncode == 0:
-            _fix_permissions(target_dir)
+    # Attempt clone, falling back to --depth=1 on network/index-pack errors
+    for attempt, depth in enumerate((CLONE_DEPTH, 1)):
+        # Remove any leftover partial clone directory before each attempt
+        if target_dir.exists():
+            _rmtree_force(target_dir)
+        try:
+            result = subprocess.run(
+                ["git", "clone", f"--depth={depth}", clone_url, str(target_dir)],
+                capture_output=True, text=True, timeout=300,
+            )
+            if result.returncode == 0:
+                _fix_permissions(target_dir)
+                if log_callback:
+                    log_callback(f"[github] ✓ Cloned {repo_name}")
+                return True
+            stderr = result.stderr.strip()
             if log_callback:
-                log_callback(f"[github] ✓ Cloned {repo_name}")
-            return True
-        else:
+                log_callback(
+                    f"[github] ✗ Failed to clone {repo_name} (depth={depth}): {stderr}"
+                )
+            # Only retry with shallower depth on known transient network errors
+            stderr_lower = stderr.lower()
+            if "fetch-pack" not in stderr_lower and "index-pack" not in stderr_lower:
+                return False
+            if depth == 1:
+                return False
             if log_callback:
-                log_callback(f"[github] ✗ Failed to clone {repo_name}: {result.stderr.strip()}")
+                log_callback(f"[github] ↩ Retrying {repo_name} with --depth=1...")
+        except Exception as exc:
+            if log_callback:
+                log_callback(f"[github] ✗ Exception cloning {repo_name}: {exc}")
             return False
-    except Exception as exc:
-        if log_callback:
-            log_callback(f"[github] ✗ Exception cloning {repo_name}: {exc}")
-        return False
+    return False
 
 
 def get_repo_readme(repo_name: str) -> str:
