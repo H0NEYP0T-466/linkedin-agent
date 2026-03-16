@@ -93,10 +93,6 @@ async def sync_repos_on_startup() -> None:
             repo["generated_description"] = desc
             await asyncio.sleep(1)
 
-        storage.save_repos_data(updated)
-        storage.write_repos_md(updated)
-        log(f"✅ repos.md updated ({len(updated)} repos).")
-
         # Add todo tasks for new repos
         for repo in new_repos:
             name = repo.get("name", "")
@@ -107,7 +103,11 @@ async def sync_repos_on_startup() -> None:
                 meta={"repo_name": name, "post_index": 1, "total_posts": 1},
             )
     else:
-        log("✅ Repos are up to date.")
+        log("✅ No new repos detected on GitHub.")
+
+    storage.save_repos_data(updated)
+    storage.write_repos_md(updated)
+    log(f"✅ repos.md updated ({len(updated)} repos).")
 
 
 async def first_run_setup() -> None:
@@ -137,7 +137,7 @@ async def first_run_setup() -> None:
     for i, repo in enumerate(repos, 1):
         repo_name = repo.get("name", "")
         log(f"[{i}/{len(repos)}] Cloning {repo_name}...")
-        github_service.clone_repo(repo, log_callback=log)
+        cloned_ok = github_service.clone_repo(repo, log_callback=log)
 
         readme = github_service.get_repo_readme(repo_name)
 
@@ -151,7 +151,7 @@ async def first_run_setup() -> None:
         enriched = dict(repo)
         enriched["generated_description"] = description
         enriched["posted"] = False
-        enriched["cloned"] = True
+        enriched["cloned"] = cloned_ok
         enriched_repos.append(enriched)
 
         # Small delay to avoid rate limits

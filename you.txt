@@ -1,0 +1,590 @@
+================================================================================
+  LINKEDIN AGENT — COMPLETE SYSTEM EXPLANATION
+  Everything you need to know about how this project works
+================================================================================
+
+--------------------------------------------------------------------------------
+OVERVIEW
+--------------------------------------------------------------------------------
+
+LinkedIn Agent is an autonomous bot that:
+  1. Watches your GitHub profile (repos, commits, new repos)
+  2. Clones every repo, reads its README, and uses an LLM to generate descriptions
+  3. Drafts LinkedIn posts about each repo and sends them to you on Telegram
+  4. Waits for you to approve / reject / improve each post before anything is published
+  5. Also monitors AI/ML tech news (HuggingFace, ArXiv, etc.) and can draft posts about those
+  6. Shows a live terminal UI in the browser so you can watch everything happen in real time
+
+There is NO automatic LinkedIn posting — every post goes through Telegram approval first.
+
+--------------------------------------------------------------------------------
+PROJECT STRUCTURE
+--------------------------------------------------------------------------------
+
+linkedin-agent/
+│
+├── backend/                      ← Python FastAPI backend (runs on port 8006)
+│   ├── main.py                   ← FastAPI app entry point + WebSocket endpoint
+│   ├── agent.py                  ← The "brain" — orchestrates everything
+│   ├── github_service.py         ← GitHub API calls + git clone/pull
+│   ├── telegram_service.py       ← Telegram bot (send/receive messages)
+│   ├── llm_service.py            ← LLM calls (LongCat / OpenAI-compatible)
+│   ├── scraper_service.py        ← RSS feed scraper for tech news
+│   ├── storage.py                ← Reads/writes all data files
+│   ├── requirements.txt          ← Python dependencies
+│   └── .env.example              ← Template for your config
+│
+├── src/                          ← React + TypeScript frontend
+│   ├── App.tsx                   ← The terminal-style browser UI
+│   ├── main.tsx                  ← React entry point
+│   └── index.css                 ← Minimal global CSS
+│
+├── data/                         ← Created at runtime, NOT committed
+│   ├── repos.json                ← Full repo data (JSON) — primary data store
+│   ├── repos.md                  ← Human-readable repo list (Markdown)
+│   ├── memory.md                 ← Log of all approved posts (style reference)
+│   ├── todo.json                 ← Queue of pending posts to draft
+│   ├── state.json                ← Tracks whether first-run init is done
+│   ├── pending_messages.json     ← Telegram messages queued while bot was offline
+│   ├── posts/                    ← Draft posts (not yet approved)
+│   │   ├── post1-2024-01-15.txt
+│   │   └── approved/             ← Posts that were approved by you
+│   │       └── post2_2024-01-15.txt
+│   └── repos/                    ← Git-cloned repositories (one folder per repo)
+│       ├── BTSC-UNet-ViT/
+│       └── ...
+│
+├── index.html                    ← Vite HTML entry for the frontend
+├── package.json                  ← Node.js deps for the frontend
+├── README.md                     ← Quick-start guide
+└── you.txt                       ← THIS FILE
+
+--------------------------------------------------------------------------------
+FILE-BY-FILE BREAKDOWN
+--------------------------------------------------------------------------------
+
+━━━ backend/main.py ━━━
+
+  Role: FastAPI application entry point and server.
+
+  What it does:
+  - Loads .env variables at startup via python-dotenv
+  - Creates the FastAPI app with CORS enabled (any origin can call the API)
+  - On startup: calls storage.ensure_data_dir() and launches agent.run_agent()
+     as an asyncio background task
+  - On shutdown: cancels the agent task and stops the Telegram bot
+  - Serves these HTTP endpoints:
+      GET  /status     → JSON with init state, repo count, task counts, agent status
+      GET  /todo       → Full todo.json list
+      GET  /repos      → Full repos.json list
+      GET  /repos/md   → The contents of repos.md as a string
+      GET  /memory     → The contents of memory.md as a string
+      POST /restart    → Cancel and restart the agent background task
+      GET  /health     → Simple {"status": "ok"}
+  - Serves a WebSocket at /ws
+      The frontend connects here to receive real-time agent log lines
+      Every time agent.log() is called, it queues the message to all WS clients
+      The server sends a ping every 30 s to keep the connection alive
+  - Runs via uvicorn on port 8006 (configurable via PORT env var)
+
+━━━ backend/agent.py ━━━
+
+  Role: The core "brain" of the system. Coordinates all other services.
+
+  Key functions:
+
+  log(msg)
+    Writes to Python logger + terminal AND broadcasts to all WebSocket clients.
+    This is how the browser terminal sees real-time updates.
+
+  check_config()
+    Checks that TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, and LLM API key are set.
+    Logs a warning if any are missing.
+
+  first_run_setup()
+    Called ONCE when state.json doesn't exist or initialized=False.
+    Steps:
+      1. Fetches all GitHub repos via GitHub API
+      2. For each repo: clones it, reads its README, calls LLM to generate a
+         2-3 sentence description
+      3. Saves everything to repos.json and writes repos.md
+      4. Builds todo.json with one (or 2-3 for starred repos) post tasks per repo
+      5. Marks state.json as initialized=True
+      6. Sends a Telegram notification
+
+  sync_repos_on_startup()
+    Called on every restart AFTER first run.
+    Steps:
+      1. Fetches current GitHub repo list
+      2. Compares with repos.json to find new repos
+      3. Clones new repos, generates descriptions for them
+      4. Pulls (git pull --ff-only) all existing repos
+      5. ALWAYS saves repos.json and writes repos.md (even if no new repos)
+      6. Adds todo tasks for any newly discovered repos
+
+  process_next_repo_post()
+    Picks the next "pending" task from todo.json and drafts a LinkedIn post.
+    Steps:
+      1. Finds next pending repo_post task in todo.json
+      2. Enforces one-post-per-day limit (checks approved/ folder)
+      3. Loads repo data + README + memory.md context
+      4. Calls LLM to draft a LinkedIn post (up to 3 attempts)
+      5. Saves draft to data/posts/
+      6. Sends draft to Telegram for review
+      7. Waits up to 24 hours for user decision:
+           approve    → saves to approved/, appends to memory.md, marks todo done
+           reject     → marks todo done, skips
+           regenerate → calls itself recursively to draft again
+           improve    → sends feedback to LLM, re-sends for approval
+           timeout    → skips for now (will retry next cycle)
+
+  check_github_updates()
+    Looks for interesting new GitHub activity (pushes, new repos).
+    Steps:
+      1. Fetches recent public events from GitHub API
+      2. Groups push events by repo, identifies CreateEvents
+      3. For each repo with pushes: fetches commits, asks LLM if it's interesting
+      4. If interesting: notifies user on Telegram, asks if they want a post
+      5. If yes: drafts and sends post for Telegram approval
+
+  post_from_news()
+    Scrapes tech news and drafts a post about the most interesting article.
+    Steps:
+      1. Fetches RSS feeds from multiple sources (see scraper_service.py)
+      2. Lists top 10 articles to LLM, asks it to pick the most interesting
+      3. Drafts a LinkedIn post about that article
+      4. Sends to Telegram for approval
+
+  handle_custom_command(text)
+    Called when the user sends any message to the Telegram bot.
+    Routes to:
+      /status   → sends agent status summary
+      /todo     → sends list of pending tasks
+      /repos    → sends repos.md content
+      /post <t> → drafts a custom post on topic t, sends for approval
+      /skip     → (handled directly by telegram_service)
+      unknown / → sends help message
+      other text → sends to LLM as casual chat, replies with chatbot response
+
+  run_agent()
+    The main entry point (called as asyncio Task from main.py).
+    Steps:
+      1. Logs startup, checks config
+      2. Registers handle_custom_command as the Telegram message callback
+      3. Starts Telegram bot (non-blocking, retries in background)
+      4. If first run: calls first_run_setup()
+         Otherwise: calls sync_repos_on_startup()
+      5. Enters infinite loop:
+           - If todo has pending tasks → process_next_repo_post()
+           - Else if GitHub has new activity → check_github_updates()
+           - Else → post_from_news()
+           - Sleep 1 hour, repeat
+
+━━━ backend/github_service.py ━━━
+
+  Role: All GitHub interactions — API calls and git operations.
+
+  Environment variables:
+    GITHUB_USERNAME  (default: H0NEYP0T-466)
+    REPOS_DIR        (default: ./data/repos)
+    CLONE_DEPTH      (default: 100 commits)
+
+  Key functions:
+
+  fetch_all_repos()
+    Uses GitHub API to get all public repos for GITHUB_USERNAME.
+    Paginates until all repos are retrieved (100 per page).
+
+  fetch_latest_commits(repo_name, limit=5)
+    Gets the last N commits for a repo via GitHub API.
+
+  fetch_recent_activity()
+    Gets the last 30 public events (pushes, new repos, etc.) for the user.
+
+  clone_repo(repo, log_callback)
+    Clones a repo to REPOS_DIR/repo_name.
+    - If the folder already exists: runs git pull --ff-only
+    - If new: tries git clone --depth=CLONE_DEPTH
+    - On failure with "fetch-pack" / "index-pack" errors (transient network
+      issues): automatically retries with --depth=1 as a fallback
+    Returns True on success, False on failure.
+
+  get_repo_readme(repo_name)
+    Reads the README file from a cloned repo (tries multiple file names).
+    Returns up to 3000 characters.
+
+  get_repo_file_tree(repo_name)
+    Returns a list of files (max depth 2, max 40 lines) from a cloned repo.
+
+  sync_repos(stored_repos, log_callback)
+    Compares stored repos vs live GitHub repos.
+    Clones new ones, pulls existing ones.
+    Returns the updated combined list.
+
+━━━ backend/storage.py ━━━
+
+  Role: All file I/O — reads and writes every data file.
+
+  Data directory: DATA_DIR (default ./data)
+
+  Files managed:
+    data/memory.md           Append-only log of approved posts
+    data/repos.md            Human-readable repo list (Markdown)
+    data/repos.json          Full repo data with generated_description, posted, cloned
+    data/todo.json           Queue of pending post tasks
+    data/state.json          Tracks initialization state
+    data/pending_messages.json  Telegram messages queued while bot was offline
+    data/posts/              Draft post text files
+    data/posts/approved/     Approved post text files
+
+  Key functions:
+
+  write_repos_md(repos)
+    Writes a Markdown file listing all repos with their generated_description
+    (falls back to GitHub description, then "No description").
+    Shows: URL, language, stars, description, topics, posted status (✅/⏳).
+
+  save_repos_data(repos) / get_repos_data()
+    JSON serialization for repos.json — the primary data store.
+
+  mark_repo_posted(repo_name)
+    Sets posted=True in repos.json and rewrites repos.md.
+
+  build_initial_todo(repos)
+    Creates todo.json with one task per repo (2 tasks for repos with >5 stars).
+
+  save_post_draft(content, label) / save_approved_post(content, label)
+    Saves post text to posts/ or posts/approved/ with auto-incremented filename.
+    Draft pattern:    post{N}-{YYYY-MM-DD}[-label].txt
+    Approved pattern: post{N}_{YYYY-MM-DD}[_label].txt
+
+  can_post_today()
+    Checks posts/approved/ to see if a post was already saved today.
+    Enforces the one-post-per-day limit.
+
+  load_pending_messages() / save_pending_messages() / add_pending_message()
+    Persist Telegram messages that couldn't be sent (bot offline).
+    Flushed automatically when the bot comes back online.
+
+━━━ backend/telegram_service.py ━━━
+
+  Role: All Telegram bot interactions — sending and receiving.
+
+  Environment variables:
+    TELEGRAM_BOT_TOKEN   Your bot token from @BotFather
+    TELEGRAM_CHAT_ID     Your personal Telegram chat ID (only this chat is trusted)
+    TELEGRAM_PROXY       Optional proxy URL (HTTPS or SOCKS5)
+
+  How it works:
+    - Uses python-telegram-bot library
+    - Bot is started non-blocking in a background asyncio task
+    - If bot startup fails (e.g. network issue), it retries every 60 seconds
+    - Messages that fail to send are queued in memory AND persisted to
+      pending_messages.json; they are re-sent when the bot connects
+
+  Message flow:
+    User → Telegram → bot receives → _handle_message():
+      "approve"           → puts {"action": "approve"} in _decision_queue
+      "reject"            → puts {"action": "reject"} in _decision_queue
+      "regenerate"        → puts {"action": "regenerate"} in _decision_queue
+      "improve: <text>"   → puts {"action": "improve", "feedback": text} in queue
+      /status, /todo etc  → calls the registered message_callback (handle_custom_command)
+      anything else       → also calls message_callback (casual chat goes to LLM)
+
+    Agent → send_post_for_review(post) → sends Markdown message with approve/reject/etc options
+    Agent → get_user_decision(timeout) → awaits _decision_queue.get() up to timeout seconds
+
+  Commands registered with Telegram:
+    /start   → shows bot info and your chat ID
+    /status  → delegates to message_callback
+    /todo    → delegates to message_callback
+    /post    → delegates to message_callback
+    /repos   → delegates to message_callback
+    /skip    → puts {"action": "reject"} in decision queue immediately
+
+━━━ backend/llm_service.py ━━━
+
+  Role: All LLM (AI) calls — text generation.
+
+  Uses LongCat's OpenAI-compatible API (or any OpenAI-format endpoint).
+  Environment variables:
+    LONGCAT_API_KEY      or OPENAI_API_KEY
+    LONGCAT_BASE_URL     (default: https://api.longcat.chat/openai)
+    LLM_MODEL            (default: longcat-flash-lite)
+    LLM_TIMEOUT_SECONDS  (default: 60)
+
+  Functions:
+
+  generate_text(prompt, temperature)
+    Core function: sends a chat completion request and returns the text.
+
+  generate_repo_description(repo, readme)
+    Writes a 2-3 sentence description of a GitHub repo.
+    Input: repo metadata + README content.
+
+  generate_linkedin_post(repo, description, readme, memory_context, post_index, total_posts)
+    Drafts a LinkedIn post about a repo.
+    - For repos with multiple posts: focuses each on overview / tech details / results
+    - Uses memory_context (previous posts) to avoid repetition
+    - Targets 150-300 words with 3-5 hashtags
+
+  generate_news_post(article, memory_context)
+    Drafts a LinkedIn post about a tech news article.
+
+  generate_custom_post(topic, repos_md, memory_context)
+    Drafts a LinkedIn post on a custom topic, mentioning relevant repos if any.
+
+  summarize_commit_activity(repo_name, commits)
+    Summarizes recent commits in 1-2 sentences.
+
+  is_activity_worth_posting(summary)
+    Asks LLM "is this interesting enough to post?" → returns bool.
+
+  chat_response(user_message, context)
+    Friendly chatbot reply for casual Telegram messages.
+
+━━━ backend/scraper_service.py ━━━
+
+  Role: Fetches the latest AI/ML/tech articles from RSS feeds.
+
+  Sources (configured in SOURCES list):
+    - HuggingFace Blog
+    - ArXiv AI (cs.AI)
+    - ArXiv ML (cs.LG)
+    - Google AI Blog
+    - Papers With Code
+    - The Gradient
+    - Towards Data Science
+
+  fetch_rss_feed(source)
+    Fetches one RSS feed, parses it with feedparser, strips HTML from summaries.
+    Returns up to MAX_ARTICLES_PER_SOURCE (3) articles per source.
+
+  fetch_latest_tech_news()
+    Fetches all sources concurrently (asyncio.gather), deduplicates by URL.
+    Returns a flat list of unique articles.
+
+  fetch_page_with_cloudflare(url)
+    Optional: uses Cloudflare Browser Rendering API to fetch JS-heavy pages.
+    Only active if CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID are set.
+
+━━━ src/App.tsx (Frontend) ━━━
+
+  Role: Terminal-style browser UI that shows agent logs in real time.
+
+  What you see:
+    - Black background, green monospace text (like a terminal)
+    - ASCII art "LINKEDIN AGENT" banner at startup
+    - Status bar at the top: ONLINE/OFFLINE, repo count, pending/done tasks
+    - Scrolling log of every message the agent emits
+    - Blinking cursor at the bottom
+
+  How it works:
+    1. On load: connects to the backend WebSocket at /ws
+    2. Receives JSON messages: {"type": "log", "message": "..."} → appends to log
+    3. Pings are silently ignored (just keep-alives)
+    4. If connection drops: auto-reconnects every 5 seconds
+    5. Polls /status every 30 seconds to update the status bar
+    6. Auto-scrolls to the bottom as new lines arrive
+    7. Keeps max 1000 log lines in memory (older lines are dropped)
+
+  Configuration:
+    VITE_BACKEND_WS   WebSocket URL (default: ws://localhost:8006/ws)
+    VITE_BACKEND_URL  HTTP URL      (default: http://localhost:8006)
+
+--------------------------------------------------------------------------------
+HOW THE CHATBOT + AGENT WORK TOGETHER
+--------------------------------------------------------------------------------
+
+The Telegram bot and the agent are tightly coupled through two mechanisms:
+
+  1. _decision_queue (asyncio.Queue in telegram_service.py)
+
+     When the agent sends a post for review (via send_post_for_review()), it
+     then calls get_user_decision(timeout=86400) which does:
+
+         return await asyncio.wait_for(_decision_queue.get(), timeout=86400)
+
+     This BLOCKS the agent's current task for up to 24 hours, waiting for the
+     user to reply on Telegram.
+
+     When the user sends "approve", "reject", "regenerate", or "improve: ...",
+     the telegram _handle_message() puts the decision into _decision_queue,
+     which unblocks the agent immediately.
+
+  2. message_callback (handle_custom_command in agent.py)
+
+     All OTHER messages (commands and casual chat) are routed to this callback.
+     It runs the command or generates a chatbot reply using the LLM.
+
+     This is non-blocking — the agent handles the message and keeps going.
+
+  Visual flow:
+
+  User types on Telegram
+        │
+        ▼
+  _handle_message() in telegram_service.py
+        │
+        ├── "approve" / "reject" / "regenerate" / "improve: ..."
+        │         │
+        │         ▼
+        │   _decision_queue.put({"action": ...})
+        │         │
+        │         ▼
+        │   agent's get_user_decision() returns
+        │         │
+        │         ▼
+        │   agent processes the decision (save, skip, regenerate)
+        │
+        └── any other text (commands, casual chat)
+                  │
+                  ▼
+            message_callback(text) = handle_custom_command()
+                  │
+                  ├── /status → read state, reply with status
+                  ├── /todo   → read todo.json, reply with list
+                  ├── /repos  → read repos.md, reply
+                  ├── /post   → generate custom post, send for approval
+                  └── chat    → LLM chat_response(), reply naturally
+
+--------------------------------------------------------------------------------
+DATA FLOW: FIRST RUN
+--------------------------------------------------------------------------------
+
+  Server starts
+      ↓
+  main.py: asyncio.create_task(agent.run_agent())
+      ↓
+  agent.run_agent():
+      - Checks config (env vars)
+      - Starts Telegram bot (background, non-blocking)
+      - storage.is_first_run() → True (no state.json)
+      ↓
+  agent.first_run_setup():
+      - github_service.fetch_all_repos() → list of repos from GitHub API
+      - For each repo:
+          github_service.clone_repo() → git clone to data/repos/<name>/
+          github_service.get_repo_readme() → read README.md
+          llm_service.generate_repo_description() → 2-3 sentence description
+      - storage.save_repos_data(enriched_repos) → writes data/repos.json
+      - storage.write_repos_md(enriched_repos)  → writes data/repos.md
+      - storage.build_initial_todo(enriched_repos) → writes data/todo.json
+      - storage.mark_initialized() → writes data/state.json {initialized: true}
+      - telegram_service.send_message("initialized!") → Telegram notification
+      ↓
+  agent enters main loop
+
+--------------------------------------------------------------------------------
+DATA FLOW: SUBSEQUENT RUNS
+--------------------------------------------------------------------------------
+
+  Server starts
+      ↓
+  agent.run_agent():
+      - storage.is_first_run() → False (state.json exists)
+      ↓
+  agent.sync_repos_on_startup():
+      - github_service.fetch_all_repos() → current GitHub list
+      - github_service.sync_repos():
+          For NEW repos: git clone
+          For EXISTING repos: git pull --ff-only
+      - If new repos found: generate descriptions, add todo tasks
+      - ALWAYS: storage.save_repos_data() + storage.write_repos_md()
+      ↓
+  agent enters main loop:
+      ┌─ pending todo tasks? → process_next_repo_post()
+      │       ↓
+      │   draft post → send to Telegram → wait for decision → act
+      │
+      ├─ no pending tasks → check_github_updates()
+      │       ↓
+      │   interesting commits? → ask user → draft → Telegram → decision
+      │
+      └─ nothing interesting → post_from_news()
+              ↓
+          fetch RSS feeds → pick best article → draft → Telegram → decision
+      
+      [sleep 1 hour, repeat]
+
+--------------------------------------------------------------------------------
+COMMON ISSUES AND FIXES
+--------------------------------------------------------------------------------
+
+  PROBLEM: "fatal: fetch-pack: invalid index-pack output" when cloning
+  -----------------------------------------------------------------------
+  This is a transient network error where git loses its connection mid-transfer.
+  FIX (now in the code): clone_repo() automatically retries with --depth=1
+  (single commit history) when this error is detected. This is much faster
+  and more reliable on unstable connections.
+
+  PROBLEM: repos.md not showing generated descriptions
+  -----------------------------------------------------------------------
+  FIX: write_repos_md() now checks generated_description first, then falls
+  back to the GitHub description, then "No description".
+
+  PROBLEM: repos.md not being updated on subsequent runs
+  -----------------------------------------------------------------------
+  Previously repos.md was only rewritten if NEW repos were discovered.
+  FIX: sync_repos_on_startup() now ALWAYS calls save_repos_data() and
+  write_repos_md() at the end, ensuring the file is always up to date.
+
+  PROBLEM: "TELEGRAM_BOT_TOKEN not set" / Telegram messages not arriving
+  -----------------------------------------------------------------------
+  Check your backend/.env file. The bot will keep retrying every 60 seconds
+  if it can't connect. Messages generated while the bot is offline are queued
+  in pending_messages.json and sent once the connection is restored.
+
+  PROBLEM: LLM calls failing
+  -----------------------------------------------------------------------
+  Check LONGCAT_API_KEY in backend/.env. The agent will use repo.get("description")
+  as fallback if the LLM fails. After 3 failed attempts on post generation, the
+  task is skipped and the agent moves on.
+
+--------------------------------------------------------------------------------
+HOW TO RUN
+--------------------------------------------------------------------------------
+
+  1. Backend:
+       cd backend
+       cp .env.example .env
+       # Edit .env: set LONGCAT_API_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+       pip install -r requirements.txt
+       python main.py
+
+  2. Frontend:
+       # From repo root
+       npm install
+       npm run dev
+       # Open http://localhost:5173
+
+  3. Get your Telegram chat ID:
+       - Start your bot on Telegram
+       - Send /start to the bot
+       - Watch the backend logs — it will print your chat ID
+       - Add it to .env as TELEGRAM_CHAT_ID
+
+--------------------------------------------------------------------------------
+ENVIRONMENT VARIABLES REFERENCE
+--------------------------------------------------------------------------------
+
+  Required:
+    LONGCAT_API_KEY       LLM API key (or OPENAI_API_KEY as alternative)
+    TELEGRAM_BOT_TOKEN    From @BotFather on Telegram
+    TELEGRAM_CHAT_ID      Your personal Telegram chat ID
+
+  Optional:
+    GITHUB_USERNAME       Default: H0NEYP0T-466
+    LLM_MODEL             Default: longcat-flash-lite
+    LONGCAT_BASE_URL      Default: https://api.longcat.chat/openai
+    LLM_TIMEOUT_SECONDS   Default: 60
+    DATA_DIR              Default: ./data
+    REPOS_DIR             Default: ./data/repos
+    PORT                  Default: 8006
+    TELEGRAM_PROXY        SOCKS5 or HTTPS proxy for blocked regions
+    CLOUDFLARE_API_TOKEN  Optional, for JS-heavy page scraping
+    CLOUDFLARE_ACCOUNT_ID Optional, for JS-heavy page scraping
+    RELOAD                Set to "1" for uvicorn auto-reload (dev only)
+
+--------------------------------------------------------------------------------
+================================================================================
