@@ -13,7 +13,7 @@ import httpx
 GITHUB_USERNAME = os.getenv("GITHUB_USERNAME", "H0NEYP0T-466")
 GITHUB_API = "https://api.github.com"
 REPOS_DIR = Path(os.getenv("REPOS_DIR", "./data/repos"))
-CLONE_DEPTH = 100
+
 
 
 def _fix_permissions(path: Path) -> None:
@@ -117,7 +117,7 @@ def clone_repo(repo: dict[str, Any], log_callback=None) -> bool:
     if log_callback:
         log_callback(f"[github] Cloning {repo_name}...")
     # Attempt clone, falling back to --depth=1 on network/index-pack errors
-    for attempt, depth in enumerate((CLONE_DEPTH, 1)):
+    for attempt, depth in enumerate((1)):
         # Remove any leftover partial clone directory before each attempt
         if target_dir.exists():
             _rmtree_force(target_dir)

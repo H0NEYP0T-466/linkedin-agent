@@ -1,2 +1,2 @@
 venv\Scripts\activate
-uvicorn main:app --reload --port 8006 --reload-exclude "data/**"
+uvicorn main:app --reload --port 8006 --reload-exclude "data/*"
