@@ -182,12 +182,16 @@ async def _handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await update.message.reply_text(
         f"👋 LinkedIn Agent is running!\nYour chat ID is: `{chat_id}`\n\n"
         "Commands:\n"
+        "/commands - Show all available commands\n"
         "/status - Agent status\n"
         "/todo - Show pending tasks\n"
         "/todo add <task> - Add a new task\n"
         "/todo done <id> - Mark a task as done\n"
         "/post <topic> - Draft a post on a topic\n"
         "/post repo:<name> - Draft a post for a specific repo\n"
+        "/postrepo <name> - Draft a post for a specific repo\n"
+        "/postactivity - Draft a post from latest GitHub activity\n"
+        "/postsource - Draft a post from latest tech news\n"
         "/repos - Show tracked repos\n"
         "/memory - Show the post memory log\n"
         "/readme <repo> - Show a repo's README\n"
@@ -218,6 +222,10 @@ async def _handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     elif lower.startswith("improve:"):
         feedback = text[len("improve:"):].strip()
         await _decision_queue.put({"action": "improve", "feedback": feedback})
+    elif lower in ("yes", "y"):
+        await _decision_queue.put({"action": "yes"})
+    elif lower in ("no", "n", "nope", "stop", "enough", "that's enough", "thats enough"):
+        await _decision_queue.put({"action": "no"})
     elif _message_callback:
         # Route all other messages (including casual chat) through the agent callback
         await _message_callback(text)
@@ -271,6 +279,28 @@ async def _handle_skip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await update.message.reply_text("⏭️ Skipped current task.")
 
 
+async def _handle_commands(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if _message_callback:
+        await _message_callback("/commands")
+
+
+async def _handle_post_repo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    args = context.args or []
+    repo_name = " ".join(args) if args else ""
+    if _message_callback:
+        await _message_callback(f"/postrepo {repo_name}")
+
+
+async def _handle_post_activity(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if _message_callback:
+        await _message_callback("/postactivity")
+
+
+async def _handle_post_source(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if _message_callback:
+        await _message_callback("/postsource")
+
+
 def _split_text(text: str, max_len: int) -> list[str]:
     chunks = []
     while len(text) > max_len:
@@ -310,6 +340,10 @@ async def _start_bot_inner(message_callback: Callable[[str], Coroutine] | None =
     _bot_app.add_handler(CommandHandler("readme", _handle_readme))
     _bot_app.add_handler(CommandHandler("pending", _handle_pending))
     _bot_app.add_handler(CommandHandler("skip", _handle_skip))
+    _bot_app.add_handler(CommandHandler("commands", _handle_commands))
+    _bot_app.add_handler(CommandHandler("postrepo", _handle_post_repo))
+    _bot_app.add_handler(CommandHandler("postactivity", _handle_post_activity))
+    _bot_app.add_handler(CommandHandler("postsource", _handle_post_source))
     _bot_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _handle_message))
 
     await _bot_app.initialize()

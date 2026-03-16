@@ -149,13 +149,17 @@ async def sync_readmes(
     stored_repos: list[dict[str, Any]],
     log_callback=None,
 ) -> tuple[list[dict[str, Any]], list[str]]:
-    """Compare local README files with remote repos and fetch any that are new/changed.
+    """Compare local repos with GitHub and fetch READMEs only when necessary.
+
+    README fetches are limited to:
+    - Repos not yet in stored_repos (genuinely new).
+    - Repos whose ``pushed_at`` timestamp changed since last sync (updated content).
+    - Repos that are stored but have no local README yet (previous fetch failed).
 
     Returns (updated_repo_list, new_repo_names).
-    New repos are repos present on GitHub but not yet in stored_repos.
     """
     _log = log_callback or (lambda m: None)
-    _log("🔄 Syncing READMEs with GitHub...")
+    _log("🔄 Syncing repos with GitHub...")
 
     try:
         remote_repos = await fetch_all_repos()
@@ -163,35 +167,64 @@ async def sync_readmes(
         _log(f"⚠️  Could not fetch remote repos: {exc}")
         return stored_repos, []
 
-    stored_names = {r.get("name", "") for r in stored_repos}
+    stored_map: dict[str, dict[str, Any]] = {r.get("name", ""): r for r in stored_repos}
     new_repo_names: list[str] = []
-    updated = list(stored_repos)
+    # Work on a copy so we can mutate entries safely
+    updated_map: dict[str, dict[str, Any]] = {k: dict(v) for k, v in stored_map.items()}
 
     for repo in remote_repos:
         repo_name = repo["name"]
-        local_readme = get_repo_readme(repo_name)
-        remote_readme = await fetch_readme_from_api(repo_name)
+        stored = stored_map.get(repo_name)
 
-        if repo_name not in stored_names:
+        if stored is None:
+            # New repo — always fetch its README
             _log(f"🆕 New repo detected: {repo_name}")
+            remote_readme = await fetch_readme_from_api(repo_name)
             if remote_readme:
                 save_readme(repo_name, remote_readme)
             entry = dict(repo)
             entry["generated_description"] = repo.get("description") or ""
             entry["posted"] = False
             entry["readme_synced"] = True
-            updated.append(entry)
+            updated_map[repo_name] = entry
             new_repo_names.append(repo_name)
         else:
-            # Update local README if it changed
-            if remote_readme and remote_readme != local_readme:
-                _log(f"[sync] README updated for {repo_name}")
-                save_readme(repo_name, remote_readme)
+            # Existing repo — only fetch README if pushed_at changed or no local README
+            old_pushed = stored.get("pushed_at")
+            new_pushed = repo.get("pushed_at")
+            local_readme = get_repo_readme(repo_name)
+            needs_fetch = (not local_readme) or (new_pushed and new_pushed != old_pushed)
+
+            if needs_fetch:
+                _log(f"[sync] Fetching README for updated repo: {repo_name}")
+                remote_readme = await fetch_readme_from_api(repo_name)
+                if remote_readme and remote_readme != local_readme:
+                    _log(f"[sync] README updated for {repo_name}")
+                    save_readme(repo_name, remote_readme)
+
+            # Always refresh the lightweight metadata (stars, pushed_at, etc.)
+            updated_entry = dict(stored)
+            for key in ("pushed_at", "updated_at", "stargazers_count", "description",
+                        "language", "topics", "html_url"):
+                if key in repo:
+                    updated_entry[key] = repo[key]
+            updated_map[repo_name] = updated_entry
 
     if new_repo_names:
         _log(f"🆕 {len(new_repo_names)} new repo(s): {', '.join(sorted(new_repo_names))}")
     else:
         _log("✅ No new repos detected on GitHub.")
 
-    return updated, new_repo_names
+    # Preserve original ordering of stored repos, append new ones at the end
+    result: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for repo in stored_repos:
+        name = repo.get("name", "")
+        result.append(updated_map.get(name, repo))
+        seen.add(name)
+    for name in new_repo_names:
+        if name not in seen:
+            result.append(updated_map[name])
+
+    return result, new_repo_names
 
