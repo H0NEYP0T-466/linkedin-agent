@@ -263,13 +263,17 @@ Answer only "yes" or "no"."""
 async def chat_response(user_message: str, context: str = "") -> str:
     """Generate a friendly conversational reply to a user message."""
     system_note = (
-        "You are a friendly AI assistant embedded in a LinkedIn content agent. "
+        "You are a helpful AI assistant embedded in a LinkedIn content agent. "
         "You help the owner manage their LinkedIn posts and GitHub repos. "
-        "Be concise, helpful, and conversational. "
-        "If the user seems to be asking about the agent or their repos/posts, give a relevant helpful answer. "
-        "Keep replies under 200 words."
+        "Be concise, honest, and conversational. "
+        "IMPORTANT: Only state facts that are present in the agent context below. "
+        "If you don't have specific data (e.g. details about a repo not listed), "
+        "say so clearly — do NOT make things up or guess. "
+        "Keep replies under 200 words. "
+        "If the user wants to do something you can't do via chat, "
+        "suggest the appropriate slash command (e.g. /post, /repos, /todo, /readme <repo>)."
     )
-    ctx_block = f"\n\nAgent context:\n{context[:600]}" if context else ""
+    ctx_block = f"\n\nAgent context:\n{context[:800]}" if context else ""
     prompt = f"""{system_note}{ctx_block}
 
 User message: {user_message}
