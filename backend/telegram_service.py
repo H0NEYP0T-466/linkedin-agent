@@ -12,6 +12,7 @@ from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, Messa
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+TELEGRAM_MESSAGE_CHUNK_SIZE = 4000
 
 logger = logging.getLogger(__name__)
 
@@ -39,7 +40,7 @@ async def send_message(text: str, chat_id: str | None = None) -> bool:
     try:
         bot = Bot(token=TELEGRAM_BOT_TOKEN)
         # Telegram max message length is 4096
-        for chunk in _split_text(text, 4000):
+        for chunk in _split_text(text, TELEGRAM_MESSAGE_CHUNK_SIZE):
             await bot.send_message(chat_id=target, text=chunk, parse_mode="Markdown")
         return True
     except TelegramError as exc:

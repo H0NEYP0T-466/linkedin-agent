@@ -119,8 +119,9 @@ def save_todo(todo: list[dict[str, Any]]) -> None:
 
 def add_todo(task: str, task_type: str = "repo_post", meta: dict | None = None) -> None:
     todo = load_todo()
+    next_id = max((item["id"] for item in todo), default=0) + 1
     todo.append({
-        "id": len(todo) + 1,
+        "id": next_id,
         "task": task,
         "type": task_type,
         "status": "pending",

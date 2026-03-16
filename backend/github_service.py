@@ -11,6 +11,7 @@ import httpx
 GITHUB_USERNAME = os.getenv("GITHUB_USERNAME", "H0NEYP0T-466")
 GITHUB_API = "https://api.github.com"
 REPOS_DIR = Path(os.getenv("REPOS_DIR", "./data/repos"))
+CLONE_DEPTH = 10
 
 
 async def fetch_all_repos() -> list[dict[str, Any]]:
@@ -86,7 +87,7 @@ def clone_repo(repo: dict[str, Any], log_callback=None) -> bool:
         log_callback(f"[github] Cloning {repo_name}...")
     try:
         result = subprocess.run(
-            ["git", "clone", "--depth=10", clone_url, str(target_dir)],
+            ["git", "clone", f"--depth={CLONE_DEPTH}", clone_url, str(target_dir)],
             capture_output=True, text=True, timeout=300,
         )
         if result.returncode == 0:

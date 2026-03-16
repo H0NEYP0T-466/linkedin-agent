@@ -14,6 +14,9 @@ import telegram_service
 
 logger = logging.getLogger(__name__)
 
+RETRY_DELAY_SECONDS = 5
+AGENT_CYCLE_INTERVAL_SECONDS = 3600
+
 # Broadcast log lines to all connected WebSocket clients
 _log_listeners: list[asyncio.Queue] = []
 
@@ -153,7 +156,7 @@ async def process_next_repo_post() -> bool:
                 log("❌ Failed to generate post after 3 attempts. Skipping.")
                 storage.complete_todo(task["id"])
                 return True
-            await asyncio.sleep(5)
+            await asyncio.sleep(RETRY_DELAY_SECONDS)
 
     log(f"📤 Sending post to Telegram for review...")
     context_str = f"Repo: {repo_name} | Post {post_index}/{total_posts}"
@@ -454,14 +457,14 @@ async def run_agent() -> None:
             if has_pending:
                 log("📋 Processing next repo post from todo list...")
                 await process_next_repo_post()
-                await asyncio.sleep(5)
+                await asyncio.sleep(RETRY_DELAY_SECONDS)
                 continue
 
             # 2. All repo posts done — check for new GitHub activity
             log("🔍 All repo posts done. Checking GitHub for new activity...")
             found = await check_github_updates()
             if found:
-                await asyncio.sleep(5)
+                await asyncio.sleep(RETRY_DELAY_SECONDS)
                 continue
 
             # 3. No GitHub activity — scrape tech news
@@ -470,7 +473,7 @@ async def run_agent() -> None:
 
             # 4. Wait before next cycle (check every hour)
             log("💤 Sleeping for 1 hour before next cycle...")
-            await asyncio.sleep(3600)
+            await asyncio.sleep(AGENT_CYCLE_INTERVAL_SECONDS)
 
         except asyncio.CancelledError:
             log("🛑 Agent loop cancelled.")

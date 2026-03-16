@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 
 const BACKEND_WS = import.meta.env.VITE_BACKEND_WS ?? 'ws://localhost:8006/ws'
 const BACKEND_URL = import.meta.env.VITE_BACKEND_URL ?? 'http://localhost:8006'
+const MAX_LOG_LINES = 1000
 
 const BANNER = `
  ██╗     ██╗███╗   ██╗██╗  ██╗███████╗██████╗ ██╗███╗   ██╗
@@ -40,7 +41,7 @@ export default function App() {
     const id = ++counterRef.current
     setLines(prev => {
       const next = [...prev, { id, text, type }]
-      return next.length > 1000 ? next.slice(-1000) : next
+      return next.length > MAX_LOG_LINES ? next.slice(-MAX_LOG_LINES) : next
     })
   }
 
