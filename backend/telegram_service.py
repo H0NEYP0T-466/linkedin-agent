@@ -153,7 +153,25 @@ async def _pending_flush_loop() -> None:
 
 
 async def send_post_for_review(post_content: str, context: str = "") -> None:
-    """Send a generated post to the user for approval."""
+    """Send a generated post to the user for approval.
+
+    Any stale decisions left in the queue from a previous session are discarded
+    before the new review message is sent, so that an old queued "reject" cannot
+    silently skip a brand-new post.
+    """
+    # Drain stale decisions that were queued while no review was active.
+    drained = 0
+    while not _decision_queue.empty():
+        try:
+            _decision_queue.get_nowait()
+            drained += 1
+        except asyncio.QueueEmpty:
+            break
+    if drained:
+        logger.warning(
+            "Discarded %d stale decision(s) from queue before new post review.", drained
+        )
+
     header = "📝 *New LinkedIn Post Draft*\n\n"
     if context:
         header += f"_{context}_\n\n"
@@ -175,6 +193,33 @@ async def get_user_decision(timeout: int = 86400) -> dict[str, Any]:
         return await asyncio.wait_for(_decision_queue.get(), timeout=float(timeout))
     except asyncio.TimeoutError:
         return {"action": "timeout"}
+
+
+def _schedule_callback(text: str) -> None:
+    """Fire the message callback as a non-blocking background task.
+
+    PTB processes updates sequentially by default (concurrent_updates=False).
+    If we directly ``await _message_callback(text)`` from a handler, the handler
+    coroutine stays alive until the callback returns — which can take up to 24 h
+    when the callback triggers a post-review loop that waits for user input.
+    While that handler is alive PTB cannot dispatch any new updates, so the
+    user's subsequent "reject"/"approve" messages are never processed, causing
+    a permanent deadlock where the bot appears completely unresponsive.
+
+    Scheduling the callback as a separate asyncio Task lets every PTB handler
+    return immediately, keeping PTB's update loop free to process incoming
+    messages (including the decision keywords needed to unblock the callback).
+    """
+    if not _message_callback:
+        return
+
+    async def _run() -> None:
+        try:
+            await _message_callback(text)
+        except Exception as exc:
+            logger.error("Message callback error for %r: %s", text[:80], exc)
+
+    asyncio.create_task(_run())
 
 
 async def _handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -227,51 +272,52 @@ async def _handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     elif lower in ("no", "n", "nope", "stop", "enough", "that's enough", "thats enough"):
         await _decision_queue.put({"action": "no"})
     elif _message_callback:
-        # Route all other messages (including casual chat) through the agent callback
-        await _message_callback(text)
+        # Run in a background task so this handler returns immediately and PTB
+        # can continue dispatching subsequent updates (e.g. "reject"/"approve").
+        _schedule_callback(text)
     else:
         await _decision_queue.put({"action": "message", "text": text})
 
 
 async def _handle_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if _message_callback:
-        await _message_callback("/status")
+        _schedule_callback("/status")
 
 
 async def _handle_todo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     args = context.args or []
     suffix = " " + " ".join(args) if args else ""
     if _message_callback:
-        await _message_callback(f"/todo{suffix}")
+        _schedule_callback(f"/todo{suffix}")
 
 
 async def _handle_post(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     args = context.args or []
     topic = " ".join(args) if args else ""
     if _message_callback:
-        await _message_callback(f"/post {topic}")
+        _schedule_callback(f"/post {topic}")
 
 
 async def _handle_repos(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if _message_callback:
-        await _message_callback("/repos")
+        _schedule_callback("/repos")
 
 
 async def _handle_memory(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if _message_callback:
-        await _message_callback("/memory")
+        _schedule_callback("/memory")
 
 
 async def _handle_readme(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     args = context.args or []
     repo_name = " ".join(args) if args else ""
     if _message_callback:
-        await _message_callback(f"/readme {repo_name}")
+        _schedule_callback(f"/readme {repo_name}")
 
 
 async def _handle_pending(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if _message_callback:
-        await _message_callback("/pending")
+        _schedule_callback("/pending")
 
 
 async def _handle_skip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -281,24 +327,24 @@ async def _handle_skip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 async def _handle_commands(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if _message_callback:
-        await _message_callback("/commands")
+        _schedule_callback("/commands")
 
 
 async def _handle_post_repo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     args = context.args or []
     repo_name = " ".join(args) if args else ""
     if _message_callback:
-        await _message_callback(f"/postrepo {repo_name}")
+        _schedule_callback(f"/postrepo {repo_name}")
 
 
 async def _handle_post_activity(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if _message_callback:
-        await _message_callback("/postactivity")
+        _schedule_callback("/postactivity")
 
 
 async def _handle_post_source(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if _message_callback:
-        await _message_callback("/postsource")
+        _schedule_callback("/postsource")
 
 
 def _split_text(text: str, max_len: int) -> list[str]:
