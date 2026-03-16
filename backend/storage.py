@@ -1,8 +1,8 @@
-"""Storage service for managing memory.md, repos.md, and todo.json."""
+"""Storage service for managing memory.md, repos.md, todo.json, posts, and approved posts."""
 
 import json
 import os
-from datetime import datetime
+from datetime import datetime, date
 from pathlib import Path
 from typing import Any
 
@@ -10,10 +10,14 @@ DATA_DIR = Path(os.getenv("DATA_DIR", "./data"))
 MEMORY_FILE = DATA_DIR / "memory.md"
 REPOS_FILE = DATA_DIR / "repos.md"
 TODO_FILE = DATA_DIR / "todo.json"
+POSTS_DIR = DATA_DIR / "posts"
+APPROVED_DIR = POSTS_DIR / "approved"
 
 
 def ensure_data_dir() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
+    POSTS_DIR.mkdir(parents=True, exist_ok=True)
+    APPROVED_DIR.mkdir(parents=True, exist_ok=True)
 
 
 # ── memory.md ────────────────────────────────────────────────────────────────
@@ -206,3 +210,78 @@ def update_state(updates: dict[str, Any]) -> None:
     state.update(updates)
     state_file = DATA_DIR / "state.json"
     state_file.write_text(json.dumps(state, indent=2), encoding="utf-8")
+
+
+# ── Posts / Approved posts ────────────────────────────────────────────────────
+
+def _next_post_number() -> int:
+    """Return the next auto-incremented post number across both posts and approved."""
+    existing: list[int] = []
+    for folder in (POSTS_DIR, APPROVED_DIR):
+        for p in folder.iterdir():
+            if p.stem.startswith("post"):
+                try:
+                    num = int(p.stem.split("-")[0].replace("post", "").split("_")[0])
+                    existing.append(num)
+                except ValueError:
+                    pass
+    return max(existing, default=0) + 1
+
+
+def save_post_draft(post_content: str, label: str = "") -> Path:
+    """Save a post draft to the posts/ folder.
+
+    Returns the path of the saved file.
+    File name pattern: post{N}-{YYYY-MM-DD}.txt
+    """
+    ensure_data_dir()
+    today = date.today().strftime("%Y-%m-%d")
+    n = _next_post_number()
+    suffix = f"-{label}" if label else ""
+    filename = f"post{n}-{today}{suffix}.txt"
+    path = POSTS_DIR / filename
+    path.write_text(post_content, encoding="utf-8")
+    return path
+
+
+def save_approved_post(post_content: str, label: str = "") -> Path:
+    """Save an approved post to posts/approved/ folder.
+
+    Returns the path of the saved file.
+    File name pattern: post{N}_{YYYY-MM-DD}.txt
+    """
+    ensure_data_dir()
+    today = date.today().strftime("%Y-%m-%d")
+    n = _next_post_number()
+    suffix = f"_{label}" if label else ""
+    filename = f"post{n}_{today}{suffix}.txt"
+    path = APPROVED_DIR / filename
+    path.write_text(post_content, encoding="utf-8")
+    return path
+
+
+def get_last_posted_date() -> date | None:
+    """Return the date of the last approved post, or None.
+
+    Approved post filenames follow the pattern: post{N}_{YYYY-MM-DD}[_label].txt
+    We split on '_' and parse the second segment as the ISO date.
+    """
+    if not APPROVED_DIR.exists():
+        return None
+    dates: list[date] = []
+    for p in APPROVED_DIR.iterdir():
+        # Expected stem: post1_2024-01-15 or post1_2024-01-15_label
+        parts = p.stem.split("_")
+        if len(parts) >= 2:
+            try:
+                dates.append(date.fromisoformat(parts[1]))
+            except ValueError:
+                pass
+    return max(dates) if dates else None
+
+
+def can_post_today() -> bool:
+    """Return True if no approved post has been saved today."""
+    last = get_last_posted_date()
+    return last != date.today()
+

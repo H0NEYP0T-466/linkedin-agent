@@ -2,6 +2,8 @@
 
 import asyncio
 import os
+import shutil
+import stat
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -12,6 +14,34 @@ GITHUB_USERNAME = os.getenv("GITHUB_USERNAME", "H0NEYP0T-466")
 GITHUB_API = "https://api.github.com"
 REPOS_DIR = Path(os.getenv("REPOS_DIR", "./data/repos"))
 CLONE_DEPTH = 100
+
+
+def _fix_permissions(path: Path) -> None:
+    """Ensure all files/dirs under path are user-writable so they can be deleted."""
+    try:
+        for root, dirs, files in os.walk(str(path)):
+            for d in dirs:
+                dp = Path(root) / d
+                dp.chmod(dp.stat().st_mode | stat.S_IRWXU)
+            for f in files:
+                fp = Path(root) / f
+                fp.chmod(fp.stat().st_mode | stat.S_IRUSR | stat.S_IWUSR)
+        path.chmod(path.stat().st_mode | stat.S_IRWXU)
+    except Exception:
+        pass  # best-effort
+
+
+def _rmtree_force(path: Path) -> None:
+    """Remove a directory tree, fixing permissions first."""
+
+    def _on_error(func, fpath, exc_info):  # noqa: ANN001
+        try:
+            Path(fpath).chmod(stat.S_IRWXU)
+            func(fpath)
+        except Exception:
+            pass
+
+    shutil.rmtree(str(path), onerror=_on_error)
 
 
 async def fetch_all_repos() -> list[dict[str, Any]]:
@@ -77,6 +107,7 @@ def clone_repo(repo: dict[str, Any], log_callback=None) -> bool:
                 ["git", "-C", str(target_dir), "pull", "--ff-only"],
                 capture_output=True, text=True, timeout=120,
             )
+            _fix_permissions(target_dir)
             return result.returncode == 0
         except Exception as exc:
             if log_callback:
@@ -91,6 +122,7 @@ def clone_repo(repo: dict[str, Any], log_callback=None) -> bool:
             capture_output=True, text=True, timeout=300,
         )
         if result.returncode == 0:
+            _fix_permissions(target_dir)
             if log_callback:
                 log_callback(f"[github] ✓ Cloned {repo_name}")
             return True
@@ -130,3 +162,49 @@ def get_repo_file_tree(repo_name: str) -> str:
         return "\n".join(lines)
     except Exception:
         return ""
+
+
+async def sync_repos(
+    stored_repos: list[dict[str, Any]],
+    log_callback=None,
+) -> list[dict[str, Any]]:
+    """Compare stored repos against GitHub, clone any new ones, pull existing.
+
+    Returns the updated full list of repos (existing + newly discovered).
+    """
+    log = log_callback or (lambda m: None)
+    log("🔄 Syncing repos with GitHub...")
+
+    try:
+        remote_repos = await fetch_all_repos()
+    except Exception as exc:
+        log(f"⚠️  Could not fetch remote repos for sync: {exc}")
+        return stored_repos
+
+    stored_names = {r.get("name", "") for r in stored_repos}
+    remote_names = {r.get("name", "") for r in remote_repos}
+
+    new_names = remote_names - stored_names
+    if new_names:
+        log(f"🆕 Found {len(new_names)} new remote repo(s): {', '.join(sorted(new_names))}")
+    else:
+        log("✅ No new repos detected on GitHub.")
+
+    updated = list(stored_repos)
+
+    # Single loop: pull existing repos, clone and record new ones
+    for repo in remote_repos:
+        repo_name = repo["name"]
+        if repo_name in new_names:
+            log(f"[sync] Cloning new repo: {repo_name}...")
+            ok = clone_repo(repo, log_callback=log)
+            entry = dict(repo)
+            entry["generated_description"] = repo.get("description") or ""
+            entry["posted"] = False
+            entry["cloned"] = ok
+            updated.append(entry)
+        else:
+            clone_repo(repo, log_callback=log)  # pulls latest for existing repos
+
+    return updated
+

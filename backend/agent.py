@@ -2,8 +2,8 @@
 
 import asyncio
 import logging
-from collections.abc import AsyncGenerator
-from datetime import datetime, timedelta
+import os
+from datetime import datetime
 from typing import Any
 
 import github_service
@@ -46,7 +46,70 @@ def log(msg: str) -> None:
             pass
 
 
+# ── Startup config check ──────────────────────────────────────────────────────
+
+def check_config() -> None:
+    """Log warnings for any missing critical environment variables."""
+    missing = []
+    if not os.getenv("TELEGRAM_BOT_TOKEN"):
+        missing.append("TELEGRAM_BOT_TOKEN")
+    if not os.getenv("TELEGRAM_CHAT_ID"):
+        missing.append("TELEGRAM_CHAT_ID")
+    if not (os.getenv("LONGCAT_API_KEY") or os.getenv("OPENAI_API_KEY")):
+        missing.append("LONGCAT_API_KEY / OPENAI_API_KEY")
+    if not os.getenv("GITHUB_USERNAME"):
+        log("⚠️  GITHUB_USERNAME not set; defaulting to H0NEYP0T-466")
+    if missing:
+        log(
+            f"❌ MISSING CONFIG: {', '.join(missing)}. "
+            "These features will be broken until you set them in backend/.env"
+        )
+        logger.error("Missing environment variables: %s", ", ".join(missing))
+    else:
+        log("✅ All required environment variables are configured.")
+
+
 # ── Initialization ────────────────────────────────────────────────────────────
+
+async def sync_repos_on_startup() -> None:
+    """On every server start: sync local repos with GitHub, update repos.md."""
+    log("🔄 Checking local repos vs GitHub...")
+    stored = storage.get_repos_data()
+    updated = await github_service.sync_repos(stored, log_callback=log)
+
+    if len(updated) != len(stored):
+        # New repos discovered — enrich them with descriptions
+        stored_names = {s["name"] for s in stored}
+        new_repos = [r for r in updated if r.get("name") not in stored_names]
+        log(f"📦 Enriching {len(new_repos)} new repo(s) with descriptions...")
+        for repo in new_repos:
+            repo_name = repo.get("name", "")
+            readme = github_service.get_repo_readme(repo_name)
+            file_tree = github_service.get_repo_file_tree(repo_name)
+            try:
+                desc = await llm_service.generate_repo_description(repo, readme, file_tree)
+            except Exception as exc:
+                log(f"⚠️  LLM description failed for {repo_name}: {exc}")
+                desc = repo.get("description") or "No description available."
+            repo["generated_description"] = desc
+            await asyncio.sleep(1)
+
+        storage.save_repos_data(updated)
+        storage.write_repos_md(updated)
+        log(f"✅ repos.md updated ({len(updated)} repos).")
+
+        # Add todo tasks for new repos
+        for repo in new_repos:
+            name = repo.get("name", "")
+            desc = repo.get("generated_description", "")
+            storage.add_todo(
+                f"Post about new repo: {name} - {desc[:80]}",
+                task_type="repo_post",
+                meta={"repo_name": name, "post_index": 1, "total_posts": 1},
+            )
+    else:
+        log("✅ Repos are up to date.")
+
 
 async def first_run_setup() -> None:
     """Perform first-run initialization: clone repos, build files."""
@@ -118,10 +181,20 @@ async def first_run_setup() -> None:
 
 # ── Main agent loop ────────────────────────────────────────────────────────────
 
+def _post_label(name: str) -> str:
+    """Sanitise a name for use as a post file-name label."""
+    return name.replace("/", "-").replace(" ", "-").lower()[:30]
+
+
 async def process_next_repo_post() -> bool:
     """Process the next pending repo post from the todo list. Returns True if processed."""
     task = storage.get_next_pending_repo_task()
     if not task:
+        return False
+
+    # Enforce one-post-per-day limit
+    if not storage.can_post_today():
+        log("📅 Already posted today. Waiting until tomorrow...")
         return False
 
     repo_name = task["meta"].get("repo_name", "")
@@ -158,7 +231,12 @@ async def process_next_repo_post() -> bool:
                 return True
             await asyncio.sleep(RETRY_DELAY_SECONDS)
 
-    log(f"📤 Sending post to Telegram for review...")
+    # Save draft to posts folder
+    label = _post_label(repo_name)
+    draft_path = storage.save_post_draft(post, label=label)
+    log(f"💾 Draft saved: {draft_path.name}")
+
+    log("📤 Sending post to Telegram for review...")
     context_str = f"Repo: {repo_name} | Post {post_index}/{total_posts}"
     await telegram_service.send_post_for_review(post, context_str)
 
@@ -168,11 +246,13 @@ async def process_next_repo_post() -> bool:
     log(f"👤 User decision: {action}")
 
     if action == "approve":
+        approved_path = storage.save_approved_post(post, label=label)
+        log(f"💾 Approved post saved: {approved_path.name}")
         storage.append_to_memory(post, repo_name)
         if post_index == total_posts:
             storage.mark_repo_posted(repo_name)
         storage.complete_todo(task["id"])
-        await telegram_service.send_message("✅ Post approved and saved to memory!")
+        await telegram_service.send_message("✅ Post approved and saved!")
         log(f"✅ Post approved for {repo_name}")
 
     elif action == "reject":
@@ -199,9 +279,13 @@ async def process_next_repo_post() -> bool:
             log(f"⚠️  Improve failed: {exc}")
             improved = post
 
+        improved_draft = storage.save_post_draft(improved, label=f"{label}-improved")
+        log(f"💾 Improved draft saved: {improved_draft.name}")
         await telegram_service.send_post_for_review(improved, f"{context_str} [IMPROVED]")
         decision2 = await telegram_service.get_user_decision(timeout=86400)
         if decision2.get("action") == "approve":
+            approved_path = storage.save_approved_post(improved, label=label)
+            log(f"💾 Approved improved post saved: {approved_path.name}")
             storage.append_to_memory(improved, repo_name)
             if post_index == total_posts:
                 storage.mark_repo_posted(repo_name)
@@ -333,8 +417,18 @@ async def post_from_news() -> None:
     article = articles[choice]
     log(f"📰 Selected: [{article['source']}] {article['title']}")
 
+    # Enforce one-post-per-day limit
+    if not storage.can_post_today():
+        log("📅 Already posted today. Skipping news post.")
+        return
+
     memory_ctx = storage.read_memory()
     post = await llm_service.generate_news_post(article, memory_ctx)
+
+    # Save draft
+    news_label = "news-" + _post_label(article.get("source", "unknown"))
+    draft_path = storage.save_post_draft(post, label=news_label)
+    log(f"💾 News draft saved: {draft_path.name}")
 
     await telegram_service.send_post_for_review(
         post, f"Source: {article['source']} | {article['title'][:60]}"
@@ -342,6 +436,8 @@ async def post_from_news() -> None:
     decision = await telegram_service.get_user_decision(timeout=86400)
 
     if decision.get("action") == "approve":
+        approved_path = storage.save_approved_post(post, label=news_label)
+        log(f"💾 Approved news post saved: {approved_path.name}")
         storage.append_to_memory(post)
         await telegram_service.send_message("✅ News post approved and saved!")
         log("✅ News post approved.")
@@ -350,9 +446,13 @@ async def post_from_news() -> None:
         improved = await llm_service.generate_text(
             f"Improve this LinkedIn post:\n{post}\n\nFeedback: {feedback}\n\nRewrite:"
         )
+        improved_draft = storage.save_post_draft(improved, label="news-improved")
+        log(f"💾 Improved news draft saved: {improved_draft.name}")
         await telegram_service.send_post_for_review(improved, "[IMPROVED NEWS POST]")
         decision2 = await telegram_service.get_user_decision(timeout=86400)
         if decision2.get("action") == "approve":
+            approved_path = storage.save_approved_post(improved, label="news")
+            log(f"💾 Approved news post saved: {approved_path.name}")
             storage.append_to_memory(improved)
             await telegram_service.send_message("✅ Improved news post approved!")
 
@@ -405,9 +505,14 @@ async def handle_custom_command(text: str) -> None:
         memory_ctx = storage.read_memory()
         try:
             post = await llm_service.generate_custom_post(topic, repos_md, memory_ctx)
+            label = "custom-" + _post_label(topic)
+            draft_path = storage.save_post_draft(post, label=label)
+            log(f"💾 Custom draft saved: {draft_path.name}")
             await telegram_service.send_post_for_review(post, f"Custom: {topic}")
             decision = await telegram_service.get_user_decision(timeout=86400)
             if decision.get("action") == "approve":
+                approved_path = storage.save_approved_post(post, label=label)
+                log(f"💾 Custom approved post saved: {approved_path.name}")
                 storage.append_to_memory(post)
                 await telegram_service.send_message("✅ Custom post approved!")
             elif decision.get("action") == "improve":
@@ -415,20 +520,42 @@ async def handle_custom_command(text: str) -> None:
                 improved = await llm_service.generate_text(
                     f"Improve this post:\n{post}\n\nFeedback: {feedback}\n\nRewrite:"
                 )
+                imp_draft = storage.save_post_draft(improved, label=f"{label}-improved")
+                log(f"💾 Improved custom draft saved: {imp_draft.name}")
                 await telegram_service.send_post_for_review(improved, "[IMPROVED]")
                 d2 = await telegram_service.get_user_decision(timeout=86400)
                 if d2.get("action") == "approve":
+                    approved_path = storage.save_approved_post(improved, label=label)
+                    log(f"💾 Custom approved post saved: {approved_path.name}")
                     storage.append_to_memory(improved)
                     await telegram_service.send_message("✅ Improved post approved!")
         except Exception as exc:
             log(f"❌ Custom post failed: {exc}")
             await telegram_service.send_message(f"❌ Failed to generate post: {exc}")
-    else:
-        # Generic message — try to handle as a topic
+    elif text.startswith("/"):
+        # Unknown slash command
         await telegram_service.send_message(
             f"🤔 Unknown command: {text}\n\nTry:\n"
             "/status, /todo, /repos, /post <topic>, or /skip"
         )
+    else:
+        # Casual / conversational message — respond as chatbot
+        log(f"💬 Casual message from user: {text[:80]}")
+        try:
+            state = storage.get_state()
+            repos = storage.get_repos_data()
+            context = (
+                f"Initialized: {state.get('initialized', False)}, "
+                f"Repos tracked: {len(repos)}"
+            )
+            reply = await llm_service.chat_response(text, context=context)
+            await telegram_service.send_message(reply)
+        except Exception as exc:
+            log(f"⚠️  Chatbot response failed: {exc}")
+            await telegram_service.send_message(
+                "Hey! 👋 I'm your LinkedIn Agent. I'm here to help manage your posts and repos.\n\n"
+                "Try: /status, /todo, /repos, /post <topic>"
+            )
 
 
 # ── Agent entrypoint ──────────────────────────────────────────────────────────
@@ -436,6 +563,9 @@ async def handle_custom_command(text: str) -> None:
 async def run_agent() -> None:
     """Main agent loop."""
     log("🤖 LinkedIn Agent starting up...")
+
+    # Check and log configuration issues immediately
+    check_config()
 
     # Register Telegram message callback
     telegram_service.set_message_callback(handle_custom_command)
@@ -447,6 +577,13 @@ async def run_agent() -> None:
     # First-run initialization
     if storage.is_first_run():
         await first_run_setup()
+    else:
+        # Sync repos on every subsequent startup
+        try:
+            await sync_repos_on_startup()
+        except Exception as exc:
+            log(f"⚠️  Repo sync failed: {exc}")
+            logger.exception("Repo sync error")
 
     # Main loop
     log("🔄 Entering main agent loop...")
@@ -482,3 +619,4 @@ async def run_agent() -> None:
             log(f"❌ Unhandled error in agent loop: {exc}")
             logger.exception("Agent loop error")
             await asyncio.sleep(30)
+
