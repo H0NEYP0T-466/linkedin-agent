@@ -1,73 +1,119 @@
-# React + TypeScript + Vite
+# LinkedIn Agent
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+An autonomous LinkedIn content agent that monitors your GitHub profile, clones your repositories, drafts posts, and sends them for your approval via Telegram.
 
-Currently, two official plugins are available:
+**LLM**: LongCat-Flash-Lite (`gemini-2.0-flash-lite`) • **Frontend**: React + TypeScript • **Backend**: Python FastAPI (port 8006)
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+---
 
-## React Compiler
+## Features
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+- 🤖 **Autonomous agent** – runs continuously, no manual intervention needed
+- 📦 **First-run setup** – clones all your GitHub repos, builds `repos.md` and a todo list
+- 📝 **Post drafting** – one (or 2–3 for larger repos) LinkedIn post per repo
+- 📱 **Telegram approval flow** – approve, reject, improve, or regenerate each post
+- 🔍 **GitHub monitoring** – detects new repos and noteworthy commits
+- 🌐 **Tech news scraping** – HuggingFace, ArXiv, Google AI Blog, Papers With Code, and more
+- 💾 **Memory** – `memory.md` tracks all approved posts; `repos.md` tracks all repos
+- 🖥️ **Terminal UI** – full-screen black terminal with green agent logs
 
-## Expanding the ESLint configuration
+---
 
-If you are developing a production application, we recommend updating the configuration to enable type-aware lint rules:
+## Quick Start
 
-```js
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
+### 1. Backend
 
-      // Remove tseslint.configs.recommended and replace with this
-      tseslint.configs.recommendedTypeChecked,
-      // Alternatively, use this for stricter rules
-      tseslint.configs.strictTypeChecked,
-      // Optionally, add this for stylistic rules
-      tseslint.configs.stylisticTypeChecked,
-
-      // Other configs...
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
+```bash
+cd backend
+cp .env.example .env
+# Fill in GOOGLE_API_KEY and TELEGRAM_CHAT_ID in .env
+pip install -r requirements.txt
+python main.py
 ```
 
-You can also install [eslint-plugin-react-x](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-x) and [eslint-plugin-react-dom](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-dom) for React-specific lint rules:
+### 2. Frontend
 
-```js
-// eslint.config.js
-import reactX from 'eslint-plugin-react-x'
-import reactDom from 'eslint-plugin-react-dom'
-
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-      // Enable lint rules for React
-      reactX.configs['recommended-typescript'],
-      // Enable lint rules for React DOM
-      reactDom.configs.recommended,
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
+```bash
+# In the repo root
+npm install
+npm run dev
 ```
+
+Open `http://localhost:5173` in your browser.
+
+---
+
+## Configuration (`.env`)
+
+| Variable | Description | Default |
+|---|---|---|
+| `GOOGLE_API_KEY` | Google Gemini API key | *required* |
+| `TELEGRAM_BOT_TOKEN` | Telegram bot token | pre-filled |
+| `TELEGRAM_CHAT_ID` | Your Telegram chat ID | *required* |
+| `GITHUB_USERNAME` | GitHub profile to monitor | `H0NEYP0T-466` |
+| `LLM_MODEL` | Gemini model name | `gemini-2.0-flash-lite` |
+| `CLOUDFLARE_API_TOKEN` | Cloudflare Browser Rendering (optional) | — |
+| `CLOUDFLARE_ACCOUNT_ID` | Cloudflare account ID (optional) | — |
+
+> **Get your Telegram chat ID**: Start the bot and send `/start` — it will reply with your chat ID.
+
+> **Get a Google API key**: Visit [aistudio.google.com](https://aistudio.google.com) → Get API key (free tier available).
+
+---
+
+## Telegram Commands
+
+| Command | Description |
+|---|---|
+| `/start` | Shows bot info and your chat ID |
+| `/status` | Agent status, repo count, task queue |
+| `/todo` | List pending tasks |
+| `/repos` | List all tracked repositories |
+| `/post <topic>` | Draft a custom post on any topic |
+| `/skip` | Skip the current pending task |
+| `approve` | ✅ Approve a drafted post |
+| `reject` | ❌ Reject / skip a drafted post |
+| `improve: <feedback>` | ✏️ Request changes with feedback |
+| `regenerate` | 🔁 Generate a fresh version |
+
+---
+
+## Agent Flow
+
+```
+First start
+  └─► Fetch all GitHub repos
+  └─► Clone each repo (one by one)
+  └─► Generate descriptions with LLM
+  └─► Write repos.md + todo.json + memory.md
+  └─► Notify via Telegram
+
+Daily loop
+  └─► Next pending repo post? → draft → Telegram review
+  └─► All repos done? → Check GitHub for new commits/repos
+  └─► Nothing interesting? → Scrape HuggingFace / ArXiv / Google AI Blog
+  └─► Draft post → Telegram review → approved posts go to memory.md
+```
+
+---
+
+## Project Structure
+
+```
+├── backend/
+│   ├── main.py              # FastAPI app + WebSocket
+│   ├── agent.py             # Core agent loop
+│   ├── github_service.py    # GitHub API + git clone
+│   ├── telegram_service.py  # Telegram bot
+│   ├── scraper_service.py   # RSS feed scraper
+│   ├── llm_service.py       # LongCat-Flash-Lite (Gemini)
+│   ├── storage.py           # memory.md / repos.md / todo.json
+│   ├── requirements.txt
+│   └── .env.example
+├── src/
+│   ├── App.tsx              # Terminal UI
+│   ├── index.css            # Minimal global styles
+│   └── main.tsx
+└── index.html
+```
+

@@ -1,0 +1,177 @@
+"""LLM service using Google Gemini (LongCat-Flash-Lite)."""
+
+import os
+from typing import Any
+
+import google.generativeai as genai
+
+LLM_MODEL = os.getenv("LLM_MODEL", "gemini-2.0-flash-lite")
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
+
+_model = None
+
+
+def get_model():
+    global _model
+    if _model is None:
+        if not GOOGLE_API_KEY:
+            raise ValueError("GOOGLE_API_KEY is not set. Please set it in your .env file.")
+        genai.configure(api_key=GOOGLE_API_KEY)
+        _model = genai.GenerativeModel(LLM_MODEL)
+    return _model
+
+
+async def generate_text(prompt: str, temperature: float = 0.7) -> str:
+    """Generate text using LongCat-Flash-Lite (Gemini)."""
+    model = get_model()
+    generation_config = genai.types.GenerationConfig(temperature=temperature)
+    response = model.generate_content(prompt, generation_config=generation_config)
+    return response.text.strip()
+
+
+async def generate_repo_description(repo: dict[str, Any], readme: str, file_tree: str) -> str:
+    """Generate a short description of a GitHub repo."""
+    prompt = f"""You are a technical writer. Based on the repository information below, 
+write a concise 2-3 sentence description of what this project does.
+
+Repository name: {repo.get('name', '')}
+GitHub description: {repo.get('description') or 'None'}
+Primary language: {repo.get('language') or 'Unknown'}
+Topics: {', '.join(repo.get('topics', []))}
+Stars: {repo.get('stargazers_count', 0)}
+
+README (first 2000 chars):
+{readme[:2000] if readme else 'Not available'}
+
+File tree:
+{file_tree[:500] if file_tree else 'Not available'}
+
+Write only the description, no headers or labels."""
+    return await generate_text(prompt, temperature=0.4)
+
+
+async def generate_linkedin_post(
+    repo: dict[str, Any],
+    description: str,
+    readme: str,
+    memory_context: str = "",
+    post_index: int = 1,
+    total_posts: int = 1,
+) -> str:
+    """Generate a LinkedIn post about a GitHub repo."""
+    post_focus = ""
+    if total_posts > 1:
+        focuses = {
+            1: "Overview and motivation — what problem does this solve and why I built it.",
+            2: "Technical deep-dive — key technologies, architecture, and interesting implementation details.",
+            3: "Results, learnings, and future plans for this project.",
+        }
+        post_focus = f"\nFocus for this post ({post_index}/{total_posts}): {focuses.get(post_index, focuses[1])}"
+
+    memory_note = ""
+    if memory_context:
+        memory_note = f"\n\nPrevious approved posts (for style reference — avoid repeating):\n{memory_context[:1000]}"
+
+    prompt = f"""You are a LinkedIn content creator for a software developer. 
+Write an engaging LinkedIn post about the following GitHub repository.{post_focus}
+
+Repository: {repo.get('name', '')}
+Description: {description}
+Language: {repo.get('language') or 'Unknown'}
+Stars: {repo.get('stargazers_count', 0)}
+URL: {repo.get('html_url', '')}
+Topics: {', '.join(repo.get('topics', []))}
+
+README excerpt:
+{readme[:1500] if readme else 'Not available'}{memory_note}
+
+Guidelines:
+- Write in first person as the developer
+- Be genuine, enthusiastic, and technical but accessible
+- Include 3-5 relevant hashtags at the end
+- 150-300 words
+- Do NOT use em-dashes (—) excessively
+- End with a call to action (check it out, feedback welcome, etc.)
+- Do NOT include placeholder text like [your name] or [link]
+
+Write only the post content, nothing else."""
+    return await generate_text(prompt, temperature=0.8)
+
+
+async def generate_news_post(article: dict[str, Any], memory_context: str = "") -> str:
+    """Generate a LinkedIn post from a news/research article."""
+    memory_note = ""
+    if memory_context:
+        memory_note = f"\n\nPrevious approved posts for style reference:\n{memory_context[:800]}"
+
+    prompt = f"""You are a LinkedIn content creator passionate about AI, ML, and technology.
+Write an engaging LinkedIn post about this news/research item.{memory_note}
+
+Title: {article.get('title', '')}
+Source: {article.get('source', '')}
+URL: {article.get('url', '')}
+Summary: {article.get('summary', '')[:1200]}
+
+Guidelines:
+- Write in first person, sharing your perspective and excitement
+- Explain why this matters to developers and the AI community
+- Include 3-5 relevant hashtags at the end
+- 150-250 words
+- Be insightful, not just a summary
+
+Write only the post content, nothing else."""
+    return await generate_text(prompt, temperature=0.8)
+
+
+async def generate_custom_post(topic: str, repos_md: str, memory_context: str = "") -> str:
+    """Generate a post on a custom topic, incorporating repo context if relevant."""
+    memory_note = ""
+    if memory_context:
+        memory_note = f"\n\nPrevious posts for style reference:\n{memory_context[:800]}"
+
+    prompt = f"""You are a LinkedIn content creator for a software developer specializing in AI/ML.
+Write an engaging LinkedIn post about: {topic}{memory_note}
+
+Check if any of the developer's repos below are relevant to this topic and mention them if so:
+{repos_md[:2000] if repos_md else 'Not available'}
+
+Guidelines:
+- Write in first person
+- Be technical but accessible
+- Include 3-5 relevant hashtags
+- 150-300 words
+- If a relevant repo exists, mention it with the GitHub link
+
+Write only the post content, nothing else."""
+    return await generate_text(prompt, temperature=0.8)
+
+
+async def summarize_commit_activity(
+    repo_name: str, commits: list[dict[str, Any]]
+) -> str:
+    """Summarize recent commit activity for deciding if it's worth a post."""
+    if not commits:
+        return ""
+    commit_messages = "\n".join(
+        f"- {c['commit']['message'].split(chr(10))[0]}"
+        for c in commits[:10]
+        if c.get("commit", {}).get("message")
+    )
+    prompt = f"""Analyze these recent commits to the '{repo_name}' repository:
+{commit_messages}
+
+In 1-2 sentences, describe what significant changes or features were added. 
+If the changes are trivial (just docs, minor fixes), say "trivial".
+Be concise."""
+    return await generate_text(prompt, temperature=0.3)
+
+
+async def is_activity_worth_posting(summary: str) -> bool:
+    """Ask the LLM if activity is worth a LinkedIn post."""
+    if not summary or summary.lower().strip() == "trivial":
+        return False
+    prompt = f"""Is this GitHub activity interesting enough to share as a LinkedIn post?
+Activity: {summary}
+Answer only "yes" or "no"."""
+    answer = await generate_text(prompt, temperature=0.1)
+    return answer.strip().lower().startswith("y")
