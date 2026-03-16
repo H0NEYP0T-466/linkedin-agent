@@ -138,10 +138,13 @@ async def health():
 
 
 if __name__ == "__main__":
+    _reload = bool(os.getenv("RELOAD", ""))
     uvicorn.run(
         "main:app",
         host="0.0.0.0",
         port=int(os.getenv("PORT", "8006")),
-        reload=False,
+        reload=_reload,
+        # Exclude the data directory so cloning repos doesn't trigger a reload
+        reload_excludes=["data", "data/**"],
         log_level="info",
     )

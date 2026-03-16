@@ -11,6 +11,8 @@ from telegram.error import TelegramError
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
 from telegram.request import HTTPXRequest
 
+import storage
+
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 # Proxy URL for regions where Telegram is blocked (e.g. socks5://user:pass@host:port
@@ -21,6 +23,10 @@ TELEGRAM_PROXY = (
     or os.getenv("https_proxy", "")
 )
 TELEGRAM_MESSAGE_CHUNK_SIZE = 4000
+# How often (seconds) the background task checks for pending messages to flush
+PENDING_FLUSH_INTERVAL = 60
+# How long (seconds) to wait before retrying a failed bot startup
+BOT_RETRY_INTERVAL = PENDING_FLUSH_INTERVAL
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +35,11 @@ _message_callback: Callable[[str], Coroutine] | None = None
 # Queue for pending agent decisions (approve/reject/etc.)
 _decision_queue: asyncio.Queue = asyncio.Queue()
 _bot_app = None
+# In-memory pending messages list (also persisted via storage)
+_pending_messages: list[str] = []
+# Background tasks
+_pending_flush_task: asyncio.Task | None = None
+_bot_start_task: asyncio.Task | None = None
 
 
 def set_message_callback(cb: Callable[[str], Coroutine]) -> None:
@@ -45,7 +56,11 @@ def _make_request() -> HTTPXRequest | None:
 
 
 async def send_message(text: str, chat_id: str | None = None) -> bool:
-    """Send a plain text message to the configured chat."""
+    """Send a plain text message to the configured chat.
+
+    If Telegram is unreachable, the message is queued and will be sent once
+    the connection is restored.
+    """
     if not TELEGRAM_BOT_TOKEN:
         logger.warning("TELEGRAM_BOT_TOKEN not set, skipping Telegram message.")
         return False
@@ -61,8 +76,80 @@ async def send_message(text: str, chat_id: str | None = None) -> bool:
             await bot.send_message(chat_id=target, text=chunk, parse_mode="Markdown")
         return True
     except TelegramError as exc:
-        logger.error("Telegram send error: %s", exc)
+        logger.error("Telegram send error: %s — queuing message for retry.", exc)
+        _queue_pending_message(text)
         return False
+    except Exception as exc:
+        logger.error("Unexpected error sending Telegram message: %s — queuing for retry.", exc)
+        _queue_pending_message(text)
+        return False
+
+
+def _queue_pending_message(text: str) -> None:
+    """Add a message to the in-memory and persistent pending queue."""
+    _pending_messages.append(text)
+    try:
+        storage.add_pending_message(text)
+    except Exception as exc:
+        logger.warning("Could not persist pending message: %s", exc)
+
+
+async def flush_pending_messages() -> int:
+    """Try to send all queued pending messages.  Returns the number successfully sent."""
+    global _pending_messages
+    if not _pending_messages:
+        return 0
+
+    sent_count = 0
+    remaining: list[str] = []
+    for i, msg in enumerate(_pending_messages):
+        ok = await _send_direct(msg)
+        if ok:
+            sent_count += 1
+        else:
+            # Telegram still down — stop attempting and carry over this and all remaining messages
+            remaining = _pending_messages[i:]
+            break
+
+    _pending_messages = remaining
+    try:
+        storage.save_pending_messages(remaining)
+    except Exception as exc:
+        logger.warning("Could not update persisted pending messages: %s", exc)
+
+    if sent_count:
+        logger.info("Flushed %d pending Telegram message(s).", sent_count)
+    return sent_count
+
+
+async def _send_direct(text: str, chat_id: str | None = None) -> bool:
+    """Low-level send that does NOT queue on failure (used for flush retries)."""
+    if not TELEGRAM_BOT_TOKEN:
+        return False
+    target = chat_id or TELEGRAM_CHAT_ID
+    if not target:
+        return False
+    try:
+        req = _make_request()
+        bot = Bot(token=TELEGRAM_BOT_TOKEN, request=req) if req else Bot(token=TELEGRAM_BOT_TOKEN)
+        for chunk in _split_text(text, TELEGRAM_MESSAGE_CHUNK_SIZE):
+            await bot.send_message(chat_id=target, text=chunk, parse_mode="Markdown")
+        return True
+    except Exception as exc:
+        logger.debug("Flush send attempt failed: %s", exc)
+        return False
+
+
+async def _pending_flush_loop() -> None:
+    """Background task: periodically flush pending messages."""
+    while True:
+        try:
+            await asyncio.sleep(PENDING_FLUSH_INTERVAL)
+            await flush_pending_messages()
+        except asyncio.CancelledError:
+            break
+        except Exception as exc:
+            logger.warning("Pending flush loop error: %s", exc)
 
 
 async def send_post_for_review(post_content: str, context: str = "") -> None:
@@ -125,6 +212,7 @@ async def _handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         feedback = text[len("improve:"):].strip()
         await _decision_queue.put({"action": "improve", "feedback": feedback})
     elif _message_callback:
+        # Route all other messages (including casual chat) through the agent callback
         await _message_callback(text)
     else:
         await _decision_queue.put({"action": "message", "text": text})
@@ -170,12 +258,9 @@ def _split_text(text: str, max_len: int) -> list[str]:
     return chunks
 
 
-async def start_bot(message_callback: Callable[[str], Coroutine] | None = None) -> None:
-    """Start the Telegram bot in polling mode (runs in background)."""
+async def _start_bot_inner(message_callback: Callable[[str], Coroutine] | None = None) -> None:
+    """Internal helper: initialize and start the bot application."""
     global _bot_app
-    if not TELEGRAM_BOT_TOKEN:
-        logger.warning("TELEGRAM_BOT_TOKEN not set. Telegram bot disabled.")
-        return
 
     if message_callback:
         set_message_callback(message_callback)
@@ -198,11 +283,83 @@ async def start_bot(message_callback: Callable[[str], Coroutine] | None = None) 
     await _bot_app.updater.start_polling(drop_pending_updates=True)
     logger.info("Telegram bot started.")
 
+    # Flush any messages that were queued while the bot was offline
+    await flush_pending_messages()
+
+
+async def _bot_start_with_retry(
+    message_callback: Callable[[str], Coroutine] | None = None,
+) -> None:
+    """Background task: start the bot, retrying every BOT_RETRY_INTERVAL s on failure."""
+    while True:
+        try:
+            await _start_bot_inner(message_callback)
+            return  # Successfully started
+        except asyncio.CancelledError:
+            return
+        except Exception as exc:
+            logger.warning(
+                "Telegram bot failed to start: %s — retrying in %ds...", exc, BOT_RETRY_INTERVAL
+            )
+            await asyncio.sleep(BOT_RETRY_INTERVAL)
+
+
+async def start_bot(message_callback: Callable[[str], Coroutine] | None = None) -> None:
+    """Start the Telegram bot in the background (non-blocking).
+
+    The bot startup is launched as an asyncio Task so the agent can continue
+    working immediately. If Telegram is unreachable, the task retries every 60 s.
+    Pending messages accumulated while offline are flushed once connected.
+    """
+    global _bot_start_task, _pending_flush_task
+
+    if not TELEGRAM_BOT_TOKEN:
+        logger.warning("TELEGRAM_BOT_TOKEN not set. Telegram bot disabled.")
+        return
+
+    if message_callback:
+        set_message_callback(message_callback)
+
+    # Load persisted pending messages into in-memory queue and immediately clear storage.
+    # Clearing storage here prevents duplicate sends if the server crashes mid-flush:
+    # the in-memory list is the single source of truth for this session.
+    persisted = storage.load_pending_messages()
+    if persisted:
+        _pending_messages.extend(persisted)
+        storage.clear_pending_messages()
+        logger.info("Loaded %d persisted pending message(s) into memory.", len(persisted))
+
+    # Start bot connection in background (non-blocking)
+    _bot_start_task = asyncio.create_task(_bot_start_with_retry(message_callback))
+
+    # Start periodic flush loop
+    _pending_flush_task = asyncio.create_task(_pending_flush_loop())
+
+    logger.info("Telegram bot startup initiated in background.")
+
 
 async def stop_bot() -> None:
-    global _bot_app
+    global _bot_app, _pending_flush_task, _bot_start_task
+    if _pending_flush_task and not _pending_flush_task.done():
+        _pending_flush_task.cancel()
+        try:
+            await _pending_flush_task
+        except asyncio.CancelledError:
+            pass
+        _pending_flush_task = None
+    if _bot_start_task and not _bot_start_task.done():
+        _bot_start_task.cancel()
+        try:
+            await _bot_start_task
+        except asyncio.CancelledError:
+            pass
+        _bot_start_task = None
     if _bot_app:
-        await _bot_app.updater.stop()
-        await _bot_app.stop()
-        await _bot_app.shutdown()
+        try:
+            await _bot_app.updater.stop()
+            await _bot_app.stop()
+            await _bot_app.shutdown()
+        except Exception as exc:
+            logger.warning("Error stopping Telegram bot: %s", exc)
         _bot_app = None
+

@@ -12,6 +12,7 @@ REPOS_FILE = DATA_DIR / "repos.md"
 TODO_FILE = DATA_DIR / "todo.json"
 POSTS_DIR = DATA_DIR / "posts"
 APPROVED_DIR = POSTS_DIR / "approved"
+PENDING_MESSAGES_FILE = DATA_DIR / "pending_messages.json"
 
 
 def ensure_data_dir() -> None:
@@ -284,4 +285,40 @@ def can_post_today() -> bool:
     """Return True if no approved post has been saved today."""
     last = get_last_posted_date()
     return last != date.today()
+
+
+# ── Pending Telegram messages ─────────────────────────────────────────────────
+
+def load_pending_messages() -> list[str]:
+    """Load pending Telegram messages from disk."""
+    if not PENDING_MESSAGES_FILE.exists():
+        return []
+    try:
+        return json.loads(PENDING_MESSAGES_FILE.read_text(encoding="utf-8"))
+    except Exception as exc:
+        import logging
+        logging.getLogger(__name__).warning(
+            "Could not load pending messages from %s: %s", PENDING_MESSAGES_FILE, exc
+        )
+        return []
+
+
+def save_pending_messages(messages: list[str]) -> None:
+    """Persist pending Telegram messages to disk."""
+    ensure_data_dir()
+    PENDING_MESSAGES_FILE.write_text(
+        json.dumps(messages, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+
+def add_pending_message(text: str) -> None:
+    """Append a message to the persistent pending queue."""
+    messages = load_pending_messages()
+    messages.append(text)
+    save_pending_messages(messages)
+
+
+def clear_pending_messages() -> None:
+    """Remove all persisted pending messages."""
+    save_pending_messages([])
 
