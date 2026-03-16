@@ -1,32 +1,47 @@
-"""LLM service using Google Gemini (LongCat-Flash-Lite)."""
+"""LLM service using LongCat OpenAI-format API."""
 
 import os
 from typing import Any
 
-import google.generativeai as genai
+import httpx
 
-LLM_MODEL = os.getenv("LLM_MODEL", "gemini-2.0-flash-lite")
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
+LLM_MODEL = os.getenv("LLM_MODEL", "longcat-flash-lite")
+LONGCAT_BASE_URL = os.getenv("LONGCAT_BASE_URL", "https://api.longcat.chat/openai").rstrip("/")
+LONGCAT_API_KEY = os.getenv("LONGCAT_API_KEY") or os.getenv("OPENAI_API_KEY", "")
+REQUEST_TIMEOUT = float(os.getenv("LLM_TIMEOUT_SECONDS", "60"))
 
-_model = None
 
-
-def get_model():
-    global _model
-    if _model is None:
-        if not GOOGLE_API_KEY:
-            raise ValueError("GOOGLE_API_KEY is not set. Please set it in your .env file.")
-        genai.configure(api_key=GOOGLE_API_KEY)
-        _model = genai.GenerativeModel(LLM_MODEL)
-    return _model
+def get_request_headers() -> dict[str, str]:
+    if not LONGCAT_API_KEY:
+        raise ValueError(
+            "LONGCAT_API_KEY (or OPENAI_API_KEY) is not set. Please set it in your .env file."
+        )
+    return {
+        "Authorization": f"Bearer {LONGCAT_API_KEY}",
+        "Content-Type": "application/json",
+    }
 
 
 async def generate_text(prompt: str, temperature: float = 0.7) -> str:
-    """Generate text using LongCat-Flash-Lite (Gemini)."""
-    model = get_model()
-    generation_config = genai.types.GenerationConfig(temperature=temperature)
-    response = model.generate_content(prompt, generation_config=generation_config)
-    return response.text.strip()
+    """Generate text using LongCat OpenAI-format chat completions."""
+    payload = {
+        "model": LLM_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": temperature,
+    }
+    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+        response = await client.post(
+            f"{LONGCAT_BASE_URL}/chat/completions",
+            headers=get_request_headers(),
+            json=payload,
+        )
+        response.raise_for_status()
+
+    data = response.json()
+    content = ((data.get("choices") or [{}])[0].get("message") or {}).get("content", "")
+    if not content:
+        raise ValueError("LongCat returned an empty completion response.")
+    return content.strip()
 
 
 async def generate_repo_description(repo: dict[str, Any], readme: str, file_tree: str) -> str:

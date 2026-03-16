@@ -2,7 +2,7 @@
 
 An autonomous LinkedIn content agent that monitors your GitHub profile, clones your repositories, drafts posts, and sends them for your approval via Telegram.
 
-**LLM**: LongCat-Flash-Lite (`gemini-2.0-flash-lite`) • **Frontend**: React + TypeScript • **Backend**: Python FastAPI (port 8006)
+**LLM**: LongCat (OpenAI-format API) • **Frontend**: React + TypeScript • **Backend**: Python FastAPI (port 8006)
 
 ---
 
@@ -26,7 +26,7 @@ An autonomous LinkedIn content agent that monitors your GitHub profile, clones y
 ```bash
 cd backend
 cp .env.example .env
-# Fill in GOOGLE_API_KEY and TELEGRAM_CHAT_ID in .env
+# Fill in LONGCAT_API_KEY and TELEGRAM_CHAT_ID in .env
 pip install -r requirements.txt
 python main.py
 ```
@@ -47,17 +47,20 @@ Open `http://localhost:5173` in your browser.
 
 | Variable | Description | Default |
 |---|---|---|
-| `GOOGLE_API_KEY` | Google Gemini API key | *required* |
+| `LONGCAT_API_KEY` | LongCat API key | *required* |
+| `OPENAI_API_KEY` | Optional fallback key name | — |
 | `TELEGRAM_BOT_TOKEN` | Telegram bot token | pre-filled |
 | `TELEGRAM_CHAT_ID` | Your Telegram chat ID | *required* |
 | `GITHUB_USERNAME` | GitHub profile to monitor | `H0NEYP0T-466` |
-| `LLM_MODEL` | Gemini model name | `gemini-2.0-flash-lite` |
+| `LLM_MODEL` | LongCat model name | `longcat-flash-lite` |
+| `LONGCAT_BASE_URL` | LongCat OpenAI-compatible base URL | `https://api.longcat.chat/openai` |
+| `LLM_TIMEOUT_SECONDS` | LLM request timeout in seconds | `60` |
 | `CLOUDFLARE_API_TOKEN` | Cloudflare Browser Rendering (optional) | — |
 | `CLOUDFLARE_ACCOUNT_ID` | Cloudflare account ID (optional) | — |
 
 > **Get your Telegram chat ID**: Start the bot and send `/start` — it will reply with your chat ID.
 
-> **Get a Google API key**: Visit [aistudio.google.com](https://aistudio.google.com) → Get API key (free tier available).
+> **LongCat endpoint**: OpenAI format is `https://api.longcat.chat/openai`.
 
 ---
 
@@ -106,7 +109,7 @@ Daily loop
 │   ├── github_service.py    # GitHub API + git clone
 │   ├── telegram_service.py  # Telegram bot
 │   ├── scraper_service.py   # RSS feed scraper
-│   ├── llm_service.py       # LongCat-Flash-Lite (Gemini)
+│   ├── llm_service.py       # LongCat OpenAI-format client
 │   ├── storage.py           # memory.md / repos.md / todo.json
 │   ├── requirements.txt
 │   └── .env.example
