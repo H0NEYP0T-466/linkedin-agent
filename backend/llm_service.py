@@ -73,8 +73,8 @@ Primary language: {repo.get('language') or 'Unknown'}
 Topics: {', '.join(repo.get('topics', []))}
 Stars: {repo.get('stargazers_count', 0)}
 
-README (first 3000 chars):
-{readme[:3000] if readme else 'Not available'}
+README:
+{readme if readme else 'Not available'}
 
 Write only the description, no headers or labels."""
     return await generate_text(prompt, temperature=0.4)
@@ -100,7 +100,7 @@ async def generate_linkedin_post(
 
     memory_note = ""
     if memory_context:
-        memory_note = f"\n\nPrevious approved posts (for style reference — avoid repeating):\n{memory_context[:1000]}"
+        memory_note = f"\n\nPrevious approved posts (for style reference — avoid repeating):\n{memory_context}"
 
     prompt = f"""You are a LinkedIn content creator for a software developer. 
 Write an engaging LinkedIn post about the following GitHub repository.{post_focus}
@@ -113,7 +113,7 @@ URL: {repo.get('html_url', '')}
 Topics: {', '.join(repo.get('topics', []))}
 
 README excerpt:
-{readme[:1500] if readme else 'Not available'}{memory_note}
+{readme if readme else 'Not available'}{memory_note}
 
 Guidelines:
 - Write in first person as the developer
@@ -163,7 +163,7 @@ async def generate_custom_post(topic: str, repos_md: str, memory_context: str = 
 Write an engaging LinkedIn post about: {topic}{memory_note}
 
 Check if any of the developer's repos below are relevant to this topic and mention them if so:
-{repos_md[:2000] if repos_md else 'Not available'}
+{repos_md if repos_md else 'Not available'}
 
 Guidelines:
 - Write in first person
@@ -211,7 +211,7 @@ What changed (summary): {activity_summary}
 
 The file I worked on ({file_path}):
 ```
-{file_content[:2500]}
+{file_content}
 ```
 {repos_note}{memory_note}
 
@@ -263,7 +263,7 @@ Answer only "yes" or "no"."""
 async def chat_response(user_message: str, context: str = "") -> str:
     """Generate a friendly conversational reply to a user message."""
     system_note = (
-        "You are a helpful AI assistant embedded in a LinkedIn content agent. "
+        "You are Isabella, a helpful AI assistant and friend embedded in a LinkedIn content agent. "
         "You help the owner manage their LinkedIn posts and GitHub repos. "
         "Be concise, honest, and conversational. "
         "IMPORTANT: Only state facts that are present in the agent context below. "
@@ -273,7 +273,7 @@ async def chat_response(user_message: str, context: str = "") -> str:
         "If the user wants to do something you can't do via chat, "
         "suggest the appropriate slash command (e.g. /post, /repos, /todo, /readme <repo>)."
     )
-    ctx_block = f"\n\nAgent context:\n{context[:800]}" if context else ""
+    ctx_block = f"\n\nAgent context:\n{context}" if context else ""
     prompt = f"""{system_note}{ctx_block}
 
 User message: {user_message}

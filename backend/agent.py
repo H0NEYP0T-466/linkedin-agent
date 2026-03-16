@@ -246,7 +246,7 @@ async def process_next_repo_post() -> str:
     action = decision.get("action", "timeout")
     log(f"👤 User decision: {action}")
 
-    if action == "approve":
+    if action == "approve" or action == "Approve":
         approved_path = storage.save_approved_post(post, label=label)
         log(f"💾 Approved post saved: {approved_path.name}")
         storage.append_to_memory(post, repo_name)
@@ -257,19 +257,19 @@ async def process_next_repo_post() -> str:
         log(f"✅ Post approved for {repo_name}")
         return "approved"
 
-    elif action == "reject":
+    elif action == "reject" or action == "Reject ":
         storage.complete_todo(task["id"])
         await telegram_service.send_message("⏭️ Post skipped.")
         log(f"⏭️ Post rejected for {repo_name}")
         return "rejected"
 
-    elif action == "regenerate":
+    elif action == "regenerate" or action == "Regenerate":
         log(f"🔄 Regenerating post for {repo_name}...")
         # Re-queue: don't mark done, just return True to retry on next loop
         await telegram_service.send_message("🔄 Regenerating post...")
         return await process_next_repo_post()
 
-    elif action == "improve":
+    elif action == "improve" or action == "Improve":
         feedback = decision.get("feedback", "")
         log(f"✏️  Improving post based on feedback: {feedback}")
         await telegram_service.send_message("✏️ Applying feedback and regenerating...")
@@ -286,7 +286,7 @@ async def process_next_repo_post() -> str:
         log(f"💾 Improved draft saved: {improved_draft.name}")
         await telegram_service.send_post_for_review(improved, f"{context_str} [IMPROVED]")
         decision2 = await telegram_service.get_user_decision(timeout=86400)
-        if decision2.get("action") == "approve":
+        if decision2.get("action") == "approve" or decision2.get("action") == "Approve":
             approved_path = storage.save_approved_post(improved, label=label)
             log(f"💾 Approved improved post saved: {approved_path.name}")
             storage.append_to_memory(improved, repo_name)
@@ -445,10 +445,10 @@ async def _offer_more_posts() -> None:
         decision = await telegram_service.get_user_decision(timeout=3600)
         action = decision.get("action", "timeout")
 
-        if action == "yes":
+        if action == "yes" or action == "Yes":
             log("📋 User wants another post. Processing next...")
             outcome = await process_next_repo_post()
-            if outcome != "approved":
+            if outcome != "approved" and outcome != "Approved":
                 # Post wasn't approved — stop asking
                 break
             # Post was approved — loop to ask again
@@ -514,13 +514,13 @@ async def post_from_news() -> None:
     )
     decision = await telegram_service.get_user_decision(timeout=86400)
 
-    if decision.get("action") == "approve":
+    if decision.get("action") == "approve" or decision.get("action") == "Approve":
         approved_path = storage.save_approved_post(post, label=news_label)
         log(f"💾 Approved news post saved: {approved_path.name}")
         storage.append_to_memory(post)
         await telegram_service.send_message("✅ News post approved and saved!")
         log("✅ News post approved.")
-    elif decision.get("action") == "improve":
+    elif decision.get("action") == "improve" or decision.get("action") == "Improve":
         feedback = decision.get("feedback", "")
         improved = await llm_service.generate_text(
             f"Improve this LinkedIn post:\n{post}\n\nFeedback: {feedback}\n\nRewrite:"
@@ -529,7 +529,7 @@ async def post_from_news() -> None:
         log(f"💾 Improved news draft saved: {improved_draft.name}")
         await telegram_service.send_post_for_review(improved, "[IMPROVED NEWS POST]")
         decision2 = await telegram_service.get_user_decision(timeout=86400)
-        if decision2.get("action") == "approve":
+        if decision2.get("action") == "approve" or decision2.get("action") == "Approve":
             approved_path = storage.save_approved_post(improved, label="news")
             log(f"💾 Approved news post saved: {approved_path.name}")
             storage.append_to_memory(improved)
@@ -560,13 +560,13 @@ async def _run_post_review_loop(
     decision = await telegram_service.get_user_decision(timeout=86400)
     action = decision.get("action", "timeout")
 
-    if action == "approve":
+    if action == "approve" or action == "Approve":
         approved_path = storage.save_approved_post(post, label=label)
         log(f"💾 Approved post saved: {approved_path.name}")
         storage.append_to_memory(post, repo_name)
         await telegram_service.send_message("✅ Post approved and saved!")
 
-    elif action == "improve":
+    elif action == "improve" or action == "Improve":
         feedback = decision.get("feedback", "")
         log(f"✏️  Improving post based on feedback: {feedback}")
         await telegram_service.send_message("✏️ Applying feedback and regenerating...")
@@ -582,7 +582,7 @@ async def _run_post_review_loop(
         log(f"💾 Improved draft saved: {imp_draft.name}")
         await telegram_service.send_post_for_review(improved, f"{context_str} [IMPROVED]")
         d2 = await telegram_service.get_user_decision(timeout=86400)
-        if d2.get("action") == "approve":
+        if d2.get("action") == "approve" or d2.get("action") == "Approve":
             approved_path = storage.save_approved_post(improved, label=label)
             log(f"💾 Approved improved post saved: {approved_path.name}")
             storage.append_to_memory(improved, repo_name)
@@ -658,7 +658,7 @@ async def handle_custom_command(text: str) -> None:
     elif text.startswith("/repos"):
         repos_md = storage.read_repos_md()
         if repos_md:
-            await telegram_service.send_message(f"📦 *Repositories*\n\n{repos_md[:3000]}")
+            await telegram_service.send_message(f"📦 *Repositories*\n\n{repos_md}")
         else:
             await telegram_service.send_message(
                 "No repos data yet. The agent will sync repos on the next startup."
@@ -667,7 +667,7 @@ async def handle_custom_command(text: str) -> None:
     elif text.startswith("/memory"):
         memory = storage.read_memory()
         if memory:
-            await telegram_service.send_message(f"🧠 *Post Memory*\n\n{memory[:3500]}")
+            await telegram_service.send_message(f"🧠 *Post Memory*\n\n{memory}")
         else:
             await telegram_service.send_message(
                 "📭 Memory is empty — no posts have been approved yet."
@@ -683,7 +683,7 @@ async def handle_custom_command(text: str) -> None:
         readme = github_service.get_repo_readme(repo_name)
         if readme:
             await telegram_service.send_message(
-                f"📄 *README: {repo_name}*\n\n{readme[:3500]}"
+                f"📄 *README: {repo_name}*\n\n{readme}"
             )
         else:
             repos = storage.get_repos_data()
