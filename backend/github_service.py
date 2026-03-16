@@ -1,10 +1,7 @@
-"""GitHub service - fetch repos, commits, and clone repositories."""
+"""GitHub service - fetch repos, README files, and commit activity."""
 
-import asyncio
+import base64
 import os
-import shutil
-import stat
-import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -14,34 +11,8 @@ GITHUB_USERNAME = os.getenv("GITHUB_USERNAME", "H0NEYP0T-466")
 GITHUB_API = "https://api.github.com"
 REPOS_DIR = Path(os.getenv("REPOS_DIR", "./data/repos"))
 
-
-
-def _fix_permissions(path: Path) -> None:
-    """Ensure all files/dirs under path are user-writable so they can be deleted."""
-    try:
-        for root, dirs, files in os.walk(str(path)):
-            for d in dirs:
-                dp = Path(root) / d
-                dp.chmod(dp.stat().st_mode | stat.S_IRWXU)
-            for f in files:
-                fp = Path(root) / f
-                fp.chmod(fp.stat().st_mode | stat.S_IRUSR | stat.S_IWUSR)
-        path.chmod(path.stat().st_mode | stat.S_IRWXU)
-    except Exception:
-        pass  # best-effort
-
-
-def _rmtree_force(path: Path) -> None:
-    """Remove a directory tree, fixing permissions first."""
-
-    def _on_error(func, fpath, exc_info):  # noqa: ANN001
-        try:
-            Path(fpath).chmod(stat.S_IRWXU)
-            func(fpath)
-        except Exception:
-            pass
-
-    shutil.rmtree(str(path), onerror=_on_error)
+README_MAX_CHARS = 5000    # Characters to keep from a fetched README
+FILE_MAX_CHARS = 4000      # Characters to keep from a fetched source file
 
 
 async def fetch_all_repos() -> list[dict[str, Any]]:
@@ -92,134 +63,135 @@ async def fetch_recent_activity() -> list[dict[str, Any]]:
         return response.json()
 
 
-def clone_repo(repo: dict[str, Any], log_callback=None) -> bool:
-    """Clone a single repo to REPOS_DIR. Returns True on success."""
-    REPOS_DIR.mkdir(parents=True, exist_ok=True)
-    repo_name = repo["name"]
-    clone_url = repo.get("clone_url") or repo.get("html_url")
-    target_dir = REPOS_DIR / repo_name
-
-    if target_dir.exists():
-        if log_callback:
-            log_callback(f"[github] Repo already cloned: {repo_name}, pulling latest...")
-        try:
-            result = subprocess.run(
-                ["git", "-C", str(target_dir), "pull", "--ff-only"],
-                capture_output=True, text=True, timeout=120,
+async def fetch_readme_from_api(repo_name: str) -> str:
+    """Fetch README content for a repo via the GitHub Contents API (no git clone)."""
+    candidates = ["README.md", "readme.md", "README.rst", "README.txt", "README"]
+    async with httpx.AsyncClient(timeout=30) as client:
+        for filename in candidates:
+            response = await client.get(
+                f"{GITHUB_API}/repos/{GITHUB_USERNAME}/{repo_name}/contents/{filename}",
+                headers={"Accept": "application/vnd.github+json"},
             )
-            _fix_permissions(target_dir)
-            return result.returncode == 0
-        except Exception as exc:
-            if log_callback:
-                log_callback(f"[github] Pull failed for {repo_name}: {exc}")
-            return False
+            if response.status_code == 200:
+                data = response.json()
+                if isinstance(data, dict) and data.get("encoding") == "base64":
+                    raw = base64.b64decode(
+                        data["content"].replace("\n", "")
+                    ).decode("utf-8", errors="ignore")
+                    return raw[:README_MAX_CHARS]
+    return ""
 
-    if log_callback:
-        log_callback(f"[github] Cloning {repo_name}...")
-    # Attempt clone, falling back to --depth=1 on network/index-pack errors
-    for attempt, depth in enumerate((1)):
-        # Remove any leftover partial clone directory before each attempt
-        if target_dir.exists():
-            _rmtree_force(target_dir)
-        try:
-            result = subprocess.run(
-                ["git", "clone", f"--depth={depth}", clone_url, str(target_dir)],
-                capture_output=True, text=True, timeout=300,
-            )
-            if result.returncode == 0:
-                _fix_permissions(target_dir)
-                if log_callback:
-                    log_callback(f"[github] ✓ Cloned {repo_name}")
-                return True
-            stderr = result.stderr.strip()
-            if log_callback:
-                log_callback(
-                    f"[github] ✗ Failed to clone {repo_name} (depth={depth}): {stderr}"
-                )
-            # Only retry with shallower depth on known transient network errors
-            stderr_lower = stderr.lower()
-            if "fetch-pack" not in stderr_lower and "index-pack" not in stderr_lower:
-                return False
-            if depth == 1:
-                return False
-            if log_callback:
-                log_callback(f"[github] ↩ Retrying {repo_name} with --depth=1...")
-        except Exception as exc:
-            if log_callback:
-                log_callback(f"[github] ✗ Exception cloning {repo_name}: {exc}")
-            return False
-    return False
+
+def save_readme(repo_name: str, content: str) -> None:
+    """Persist README content under REPOS_DIR/{repo_name}/README.md."""
+    readme_dir = REPOS_DIR / repo_name
+    readme_dir.mkdir(parents=True, exist_ok=True)
+    (readme_dir / "README.md").write_text(content, encoding="utf-8")
+
+
+async def fetch_and_save_readme(repo_name: str, log_callback=None) -> str:
+    """Fetch README from GitHub API, save locally, and return content."""
+    _log = log_callback or (lambda m: None)
+    _log(f"[github] Fetching README for {repo_name}...")
+    content = await fetch_readme_from_api(repo_name)
+    if content:
+        save_readme(repo_name, content)
+        _log(f"[github] ✓ README saved for {repo_name}")
+    else:
+        _log(f"[github] ⚠ No README found for {repo_name}")
+    return content
 
 
 def get_repo_readme(repo_name: str) -> str:
-    """Read the README from a cloned repo."""
+    """Read the locally saved README for a repo."""
     for name in ["README.md", "readme.md", "README.rst", "README.txt", "README"]:
         readme_path = REPOS_DIR / repo_name / name
         if readme_path.exists():
             content = readme_path.read_text(encoding="utf-8", errors="ignore")
-            return content[:3000]
+            return content[:README_MAX_CHARS]
     return ""
 
 
-def get_repo_file_tree(repo_name: str) -> str:
-    """Get a brief file listing from a cloned repo."""
-    repo_path = REPOS_DIR / repo_name
-    if not repo_path.exists():
-        return ""
-    try:
-        result = subprocess.run(
-            ["find", str(repo_path), "-maxdepth", "2", "-type", "f",
-             "-not", "-path", "*/.*", "-not", "-path", "*/node_modules/*",
-             "-not", "-path", "*/__pycache__/*"],
-            capture_output=True, text=True, timeout=10,
+async def fetch_commit_details(repo_name: str, commit_sha: str) -> dict[str, Any]:
+    """Fetch a single commit with the list of changed files."""
+    async with httpx.AsyncClient(timeout=30) as client:
+        response = await client.get(
+            f"{GITHUB_API}/repos/{GITHUB_USERNAME}/{repo_name}/commits/{commit_sha}",
+            headers={"Accept": "application/vnd.github+json"},
         )
-        lines = result.stdout.strip().split("\n")[:40]
-        return "\n".join(lines)
-    except Exception:
-        return ""
+        if response.status_code != 200:
+            return {}
+        return response.json()
 
 
-async def sync_repos(
+async def fetch_file_content(repo_name: str, file_path: str, ref: str = "") -> str:
+    """Fetch the raw content of a single file from a repo at a given ref."""
+    params: dict[str, str] = {}
+    if ref:
+        params["ref"] = ref
+    async with httpx.AsyncClient(timeout=30) as client:
+        response = await client.get(
+            f"{GITHUB_API}/repos/{GITHUB_USERNAME}/{repo_name}/contents/{file_path}",
+            params=params,
+            headers={"Accept": "application/vnd.github+json"},
+        )
+        if response.status_code == 200:
+            data = response.json()
+            if isinstance(data, dict) and data.get("encoding") == "base64":
+                raw = base64.b64decode(
+                    data["content"].replace("\n", "")
+                ).decode("utf-8", errors="ignore")
+                return raw[:FILE_MAX_CHARS]
+    return ""
+
+
+async def sync_readmes(
     stored_repos: list[dict[str, Any]],
     log_callback=None,
-) -> list[dict[str, Any]]:
-    """Compare stored repos against GitHub, clone any new ones, pull existing.
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Compare local README files with remote repos and fetch any that are new/changed.
 
-    Returns the updated full list of repos (existing + newly discovered).
+    Returns (updated_repo_list, new_repo_names).
+    New repos are repos present on GitHub but not yet in stored_repos.
     """
-    log = log_callback or (lambda m: None)
-    log("🔄 Syncing repos with GitHub...")
+    _log = log_callback or (lambda m: None)
+    _log("🔄 Syncing READMEs with GitHub...")
 
     try:
         remote_repos = await fetch_all_repos()
     except Exception as exc:
-        log(f"⚠️  Could not fetch remote repos for sync: {exc}")
-        return stored_repos
+        _log(f"⚠️  Could not fetch remote repos: {exc}")
+        return stored_repos, []
 
     stored_names = {r.get("name", "") for r in stored_repos}
-    remote_names = {r.get("name", "") for r in remote_repos}
-
-    new_names = remote_names - stored_names
-    if new_names:
-        log(f"🆕 Found {len(new_names)} new remote repo(s): {', '.join(sorted(new_names))}")
-    else:
-        log("✅ No new repos detected on GitHub.")
-
+    new_repo_names: list[str] = []
     updated = list(stored_repos)
 
-    # Single loop: pull existing repos, clone and record new ones
     for repo in remote_repos:
         repo_name = repo["name"]
-        if repo_name in new_names:
-            log(f"[sync] Cloning new repo: {repo_name}...")
-            ok = clone_repo(repo, log_callback=log)
+        local_readme = get_repo_readme(repo_name)
+        remote_readme = await fetch_readme_from_api(repo_name)
+
+        if repo_name not in stored_names:
+            _log(f"🆕 New repo detected: {repo_name}")
+            if remote_readme:
+                save_readme(repo_name, remote_readme)
             entry = dict(repo)
             entry["generated_description"] = repo.get("description") or ""
             entry["posted"] = False
-            entry["cloned"] = ok
+            entry["readme_synced"] = True
             updated.append(entry)
+            new_repo_names.append(repo_name)
         else:
-            clone_repo(repo, log_callback=log)  # pulls latest for existing repos
+            # Update local README if it changed
+            if remote_readme and remote_readme != local_readme:
+                _log(f"[sync] README updated for {repo_name}")
+                save_readme(repo_name, remote_readme)
 
-    return updated
+    if new_repo_names:
+        _log(f"🆕 {len(new_repo_names)} new repo(s): {', '.join(sorted(new_repo_names))}")
+    else:
+        _log("✅ No new repos detected on GitHub.")
+
+    return updated, new_repo_names
 

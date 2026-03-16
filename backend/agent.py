@@ -17,6 +17,11 @@ logger = logging.getLogger(__name__)
 RETRY_DELAY_SECONDS = 5
 AGENT_CYCLE_INTERVAL_SECONDS = 3600
 
+# File extensions that are generally not interesting for a LinkedIn post
+_UNINTERESTING_EXTENSIONS = (
+    ".lock", ".txt", ".md", ".json", ".yaml", ".yml", ".toml",
+)
+
 # Broadcast log lines to all connected WebSocket clients
 _log_listeners: list[asyncio.Queue] = []
 
@@ -72,15 +77,14 @@ def check_config() -> None:
 # ── Initialization ────────────────────────────────────────────────────────────
 
 async def sync_repos_on_startup() -> None:
-    """On every server start: sync local repos with GitHub, update repos.md."""
-    log("🔄 Checking local repos vs GitHub...")
+    """On every server start: sync local READMEs with GitHub, update repos.md."""
+    log("🔄 Checking local READMEs vs GitHub...")
     stored = storage.get_repos_data()
-    updated = await github_service.sync_repos(stored, log_callback=log)
+    updated, new_repo_names = await github_service.sync_readmes(stored, log_callback=log)
 
-    if len(updated) != len(stored):
-        # New repos discovered — enrich them with descriptions
-        stored_names = {s["name"] for s in stored}
-        new_repos = [r for r in updated if r.get("name") not in stored_names]
+    if new_repo_names:
+        # New repos discovered — enrich them with descriptions and queue posts
+        new_repos = [r for r in updated if r.get("name") in set(new_repo_names)]
         log(f"📦 Enriching {len(new_repos)} new repo(s) with descriptions...")
         for repo in new_repos:
             repo_name = repo.get("name", "")
@@ -111,7 +115,7 @@ async def sync_repos_on_startup() -> None:
 
 
 async def first_run_setup() -> None:
-    """Perform first-run initialization: clone repos, build files."""
+    """Perform first-run initialization: fetch READMEs and build files."""
     log("🚀 First run detected. Starting initialization...")
 
     storage.ensure_data_dir()
@@ -132,12 +136,12 @@ async def first_run_setup() -> None:
 
     log(f"📦 Found {len(repos)} repositories. Initializing repos.md...")
 
-    # Enrich each repo with a generated description
+    # Enrich each repo with a generated description (fetch README via API only)
     enriched_repos: list[dict[str, Any]] = []
     for i, repo in enumerate(repos, 1):
         repo_name = repo.get("name", "")
-        log(f"[{i}/{len(repos)}] Cloning {repo_name}...")
-        cloned_ok = github_service.clone_repo(repo, log_callback=log)
+        log(f"[{i}/{len(repos)}] Fetching README for {repo_name}...")
+        await github_service.fetch_and_save_readme(repo_name, log_callback=log)
 
         readme = github_service.get_repo_readme(repo_name)
 
@@ -151,7 +155,7 @@ async def first_run_setup() -> None:
         enriched = dict(repo)
         enriched["generated_description"] = description
         enriched["posted"] = False
-        enriched["cloned"] = cloned_ok
+        enriched["readme_synced"] = True
         enriched_repos.append(enriched)
 
         # Small delay to avoid rate limits
@@ -312,9 +316,8 @@ async def check_github_updates() -> bool:
         log("ℹ️  No recent GitHub activity found.")
         return False
 
-    # Group push events by repo
-    push_repos: dict[str, list[str]] = {}
-    new_repos: list[str] = []
+    # Collect push events keyed by repo, preserving latest commit SHAs
+    push_repos: dict[str, list[dict]] = {}
 
     for event in events[:20]:
         etype = event.get("type", "")
@@ -322,16 +325,14 @@ async def check_github_updates() -> bool:
         repo_name = repo_info.get("name", "").split("/")[-1]
         if etype == "PushEvent":
             payload = event.get("payload", {})
-            messages = [c.get("message", "").split("\n")[0] for c in payload.get("commits", [])]
+            commits = payload.get("commits", [])
             if repo_name not in push_repos:
                 push_repos[repo_name] = []
-            push_repos[repo_name].extend(messages)
-        elif etype == "CreateEvent" and event.get("payload", {}).get("ref_type") == "repository":
-            new_repos.append(repo_name)
+            push_repos[repo_name].extend(commits)
 
     # Check each active repo
     found_interesting = False
-    for repo_name, commit_msgs in push_repos.items():
+    for repo_name, event_commits in push_repos.items():
         log(f"🔍 Analyzing activity for {repo_name}...")
         try:
             commits = await github_service.fetch_latest_commits(repo_name, limit=10)
@@ -341,40 +342,79 @@ async def check_github_updates() -> bool:
             log(f"⚠️  Analysis failed for {repo_name}: {exc}")
             continue
 
-        if interesting:
-            log(f"💡 Interesting activity found in {repo_name}: {summary}")
-            await telegram_service.send_message(
-                f"🔍 *New Activity Detected*\n\nRepo: `{repo_name}`\n{summary}\n\n"
-                f"Reply 'yes' to draft a post or 'no' to skip."
-            )
-            decision = await telegram_service.get_user_decision(timeout=3600)
-            if decision.get("action") in ("approve", "message") and \
-               decision.get("text", "").lower().startswith("y"):
-                repos = storage.get_repos_data()
-                repo = next((r for r in repos if r.get("name") == repo_name), {})
-                readme = github_service.get_repo_readme(repo_name)
-                description = repo.get("generated_description") or summary
-                memory_ctx = storage.read_memory()
-                post = await llm_service.generate_linkedin_post(
-                    repo, description, readme, memory_ctx
-                )
-                await telegram_service.send_post_for_review(
-                    post, f"Recent activity: {repo_name}"
-                )
-                decision2 = await telegram_service.get_user_decision(timeout=86400)
-                if decision2.get("action") == "approve":
-                    storage.append_to_memory(post, repo_name)
-                    await telegram_service.send_message("✅ Post approved!")
-            found_interesting = True
-            break  # One post per cycle
+        if not interesting:
+            continue
 
-    for repo_name in new_repos:
-        log(f"🆕 New repository created: {repo_name}")
+        log(f"💡 Interesting activity found in {repo_name}: {summary}")
+
+        # Find the most relevant changed file from the latest commit
+        latest_sha = (event_commits[0].get("sha") or "") if event_commits else ""
+        file_path = ""
+        file_content = ""
+        if latest_sha:
+            try:
+                commit_details = await github_service.fetch_commit_details(repo_name, latest_sha)
+                changed_files = [
+                    f["filename"] for f in commit_details.get("files", [])
+                    if not f["filename"].endswith(_UNINTERESTING_EXTENSIONS)
+                ]
+                if not changed_files:
+                    # Fall back to any changed file
+                    changed_files = [f["filename"] for f in commit_details.get("files", [])]
+                if changed_files:
+                    file_path = changed_files[0]
+                    file_content = await github_service.fetch_file_content(
+                        repo_name, file_path, ref=latest_sha
+                    )
+                    log(f"[github] Fetched changed file: {file_path} ({len(file_content)} chars)")
+            except Exception as exc:
+                log(f"⚠️  Could not fetch commit file for {repo_name}: {exc}")
+
         await telegram_service.send_message(
-            f"🆕 New repo detected: `{repo_name}`! Should I draft a post? Reply 'yes' or 'no'."
+            f"🔍 *New Activity Detected*\n\nRepo: `{repo_name}`\n{summary}\n\n"
+            f"Reply 'yes' to draft a post or 'no' to skip."
         )
+        decision = await telegram_service.get_user_decision(timeout=3600)
+        if (decision.get("action") in ("approve", "message")
+                and decision.get("text", "").lower().startswith("y")):
+            repos = storage.get_repos_data()
+            repo = next((r for r in repos if r.get("name") == repo_name), {})
+            memory_ctx = storage.read_memory()
+            repos_md = storage.read_repos_md()
+            try:
+                if file_content:
+                    post = await llm_service.generate_commit_activity_post(
+                        repo_name, repo, file_path, file_content, summary,
+                        memory_ctx, repos_md
+                    )
+                else:
+                    # No file content available — fall back to readme-based post
+                    readme = github_service.get_repo_readme(repo_name)
+                    description = repo.get("generated_description") or summary
+                    post = await llm_service.generate_linkedin_post(
+                        repo, description, readme, memory_ctx
+                    )
+            except Exception as exc:
+                log(f"⚠️  Post generation failed: {exc}")
+                found_interesting = True
+                break
+
+            label = _post_label(repo_name)
+            draft_path = storage.save_post_draft(post, label=f"{label}-activity")
+            log(f"💾 Activity draft saved: {draft_path.name}")
+            await telegram_service.send_post_for_review(
+                post, f"Recent activity: {repo_name}"
+            )
+            decision2 = await telegram_service.get_user_decision(timeout=86400)
+            if decision2.get("action") == "approve":
+                approved_path = storage.save_approved_post(post, label=label)
+                log(f"💾 Approved activity post saved: {approved_path.name}")
+                storage.append_to_memory(post, repo_name)
+                await telegram_service.send_message("✅ Post approved!")
+            else:
+                await telegram_service.send_message("⏭️ Post skipped.")
         found_interesting = True
-        break
+        break  # One post per cycle
 
     return found_interesting
 
