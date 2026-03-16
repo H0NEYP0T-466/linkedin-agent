@@ -188,16 +188,15 @@ def _post_label(name: str) -> str:
     return name.replace("/", "-").replace(" ", "-").lower()[:30]
 
 
-async def process_next_repo_post() -> bool:
-    """Process the next pending repo post from the todo list. Returns True if processed."""
+async def process_next_repo_post() -> str:
+    """Process the next pending repo post from the todo list.
+
+    Returns one of: "approved", "rejected", "timeout", "no_task", "error".
+    The caller is responsible for checking can_post_today() before calling this.
+    """
     task = storage.get_next_pending_repo_task()
     if not task:
-        return False
-
-    # Enforce one-post-per-day limit
-    if not storage.can_post_today():
-        log("📅 Already posted today. Waiting until tomorrow...")
-        return False
+        return "no_task"
 
     repo_name = task["meta"].get("repo_name", "")
     post_index = task["meta"].get("post_index", 1)
@@ -210,7 +209,7 @@ async def process_next_repo_post() -> bool:
     if not repo:
         log(f"⚠️  Repo {repo_name} not found in data. Skipping task.")
         storage.complete_todo(task["id"])
-        return True
+        return "rejected"
 
     readme = github_service.get_repo_readme(repo_name)
     description = repo.get("generated_description") or repo.get("description") or ""
@@ -230,7 +229,7 @@ async def process_next_repo_post() -> bool:
             if attempt == max_attempts:
                 log("❌ Failed to generate post after 3 attempts. Skipping.")
                 storage.complete_todo(task["id"])
-                return True
+                return "error"
             await asyncio.sleep(RETRY_DELAY_SECONDS)
 
     # Save draft to posts folder
@@ -256,11 +255,13 @@ async def process_next_repo_post() -> bool:
         storage.complete_todo(task["id"])
         await telegram_service.send_message("✅ Post approved and saved!")
         log(f"✅ Post approved for {repo_name}")
+        return "approved"
 
     elif action == "reject":
         storage.complete_todo(task["id"])
         await telegram_service.send_message("⏭️ Post skipped.")
         log(f"⏭️ Post rejected for {repo_name}")
+        return "rejected"
 
     elif action == "regenerate":
         log(f"🔄 Regenerating post for {repo_name}...")
@@ -293,14 +294,17 @@ async def process_next_repo_post() -> bool:
                 storage.mark_repo_posted(repo_name)
             storage.complete_todo(task["id"])
             await telegram_service.send_message("✅ Improved post approved!")
+            return "approved"
         else:
             storage.complete_todo(task["id"])
             await telegram_service.send_message("⏭️ Post skipped.")
+            return "rejected"
 
     elif action == "timeout":
         log("⏰ No response from user. Skipping post for now.")
+        return "timeout"
 
-    return True
+    return "rejected"
 
 
 async def check_github_updates() -> bool:
@@ -372,11 +376,10 @@ async def check_github_updates() -> bool:
 
         await telegram_service.send_message(
             f"🔍 *New Activity Detected*\n\nRepo: `{repo_name}`\n{summary}\n\n"
-            f"Reply 'yes' to draft a post or 'no' to skip."
+            f"Reply `yes` to draft a post or `no` to skip."
         )
         decision = await telegram_service.get_user_decision(timeout=3600)
-        if (decision.get("action") in ("approve", "message")
-                and decision.get("text", "").lower().startswith("y")):
+        if decision.get("action") == "yes":
             repos = storage.get_repos_data()
             repo = next((r for r in repos if r.get("name") == repo_name), {})
             memory_ctx = storage.read_memory()
@@ -417,6 +420,44 @@ async def check_github_updates() -> bool:
         break  # One post per cycle
 
     return found_interesting
+
+
+async def _offer_more_posts() -> None:
+    """After an approved post, ask the user whether they want another post today.
+
+    Loops until the user says no, there are no more pending tasks, or today's
+    posting quota is exhausted.
+    """
+    while True:
+        has_more = bool(storage.get_next_pending_repo_task())
+        if not has_more or not storage.can_post_today():
+            if not has_more:
+                log("📋 No more pending repo posts in the queue.")
+                await telegram_service.send_message(
+                    "📋 There are no more pending posts in the queue for today."
+                )
+            break
+
+        await telegram_service.send_message(
+            "📝 Do you need another post for today?\n"
+            "Reply `yes` to process the next one, or `no` to stop."
+        )
+        decision = await telegram_service.get_user_decision(timeout=3600)
+        action = decision.get("action", "timeout")
+
+        if action == "yes":
+            log("📋 User wants another post. Processing next...")
+            outcome = await process_next_repo_post()
+            if outcome != "approved":
+                # Post wasn't approved — stop asking
+                break
+            # Post was approved — loop to ask again
+        else:
+            await telegram_service.send_message(
+                "👍 Alright, that's enough for today! See you next time. 🎉"
+            )
+            log("🛑 User declined additional posts for today.")
+            break
 
 
 async def post_from_news() -> None:
@@ -725,21 +766,105 @@ async def handle_custom_command(text: str) -> None:
             log(f"❌ Custom post failed: {exc}")
             await telegram_service.send_message(f"❌ Failed to generate post: {exc}")
 
-    elif text.startswith("/"):
-        # Unknown slash command
+    elif text.startswith("/commands"):
+        _COMMANDS_HELP = (
+            "📋 *Available Commands*\n\n"
+            "• `/commands` — show this help message\n"
+            "• `/status` — agent status & stats\n"
+            "• `/todo` — list pending tasks\n"
+            "• `/todo add <task>` — add a new task\n"
+            "• `/todo done <id>` — mark a task as done\n"
+            "• `/post <topic>` — draft a post on any topic\n"
+            "• `/post repo:<name>` — draft a post for a specific repo\n"
+            "• `/postrepo <name>` — draft a post for a specific repo\n"
+            "• `/postrepo-<name>` — same as above (hyphen format)\n"
+            "• `/postactivity` — draft a post from latest GitHub activity\n"
+            "• `/postsource` — draft a post from the latest tech news\n"
+            "• `/repos` — list tracked repositories\n"
+            "• `/memory` — show the post history log\n"
+            "• `/readme <repo>` — show a repo's README\n"
+            "• `/pending` — show pending draft posts\n"
+            "• `/skip` — skip the current pending task\n\n"
+            "💬 _You can also chat naturally!_"
+        )
+        await telegram_service.send_message(_COMMANDS_HELP)
+
+    elif text.lower().startswith("/postrepo"):
+        # Handles both "/postrepo REPONAME" and "/postrepo-REPONAME"
+        remainder = text[9:].strip()  # everything after "/postrepo"
+        if remainder.startswith("-"):
+            repo_name = remainder[1:].strip()
+        else:
+            repo_name = remainder
+
+        if not repo_name:
+            await telegram_service.send_message(
+                "Usage:\n"
+                "• `/postrepo <name>` — draft a post for a specific repo\n"
+                "• `/postrepo-<name>` — same with hyphen format\n\n"
+                "Use /repos to see all tracked repositories."
+            )
+            return
+
+        repos = storage.get_repos_data()
+        repo = next(
+            (r for r in repos if r.get("name", "").lower() == repo_name.lower()), None
+        )
+        if not repo:
+            await telegram_service.send_message(
+                f"❌ I don't have data for repo `{repo_name}`.\n\n"
+                "Use /repos to see all tracked repositories."
+            )
+            return
+
+        log(f"✍️  Drafting repo post (/postrepo) for: {repo_name}")
         await telegram_service.send_message(
-            f"🤔 Unknown command: `{text}`\n\nAvailable commands:\n"
-            "/status — agent status\n"
-            "/todo — pending tasks\n"
-            "/todo add <task> — add a task\n"
-            "/todo done <id> — complete a task\n"
-            "/post <topic> — draft a post\n"
-            "/post repo:<name> — draft a post for a specific repo\n"
-            "/repos — tracked repositories\n"
-            "/memory — post memory log\n"
-            "/readme <repo> — show a repo's README\n"
-            "/pending — pending draft posts\n"
-            "/skip — skip current task"
+            f"✍️ Drafting a LinkedIn post for repo `{repo_name}`..."
+        )
+        readme = github_service.get_repo_readme(repo_name)
+        description = repo.get("generated_description") or repo.get("description") or ""
+        memory_ctx = storage.read_memory()
+        try:
+            post = await llm_service.generate_linkedin_post(
+                repo, description, readme, memory_ctx
+            )
+            label = "repo-" + _post_label(repo_name)
+            await _run_post_review_loop(post, label, f"Repo: {repo_name}", repo_name)
+        except Exception as exc:
+            log(f"❌ /postrepo failed: {exc}")
+            await telegram_service.send_message(f"❌ Failed to generate post: {exc}")
+
+    elif text.startswith("/postactivity"):
+        log("🔍 /postactivity command: checking GitHub for recent activity...")
+        await telegram_service.send_message(
+            "🔍 Checking GitHub for recent activity. This may take a moment..."
+        )
+        try:
+            found = await check_github_updates()
+            if not found:
+                await telegram_service.send_message(
+                    "ℹ️ No interesting GitHub activity found to post about right now."
+                )
+        except Exception as exc:
+            log(f"❌ /postactivity failed: {exc}")
+            await telegram_service.send_message(f"❌ Failed to check activity: {exc}")
+
+    elif text.startswith("/postsource"):
+        log("📰 /postsource command: fetching latest tech news...")
+        await telegram_service.send_message(
+            "📰 Fetching latest tech news. This may take a moment..."
+        )
+        try:
+            await post_from_news()
+        except Exception as exc:
+            log(f"❌ /postsource failed: {exc}")
+            await telegram_service.send_message(f"❌ Failed to fetch news: {exc}")
+
+    elif text.startswith("/"):
+        # Unknown slash command — show commands help
+        await telegram_service.send_message(
+            f"🤔 Unknown command: `{text}`\n\n"
+            "Use /commands to see all available commands."
         )
 
     else:
@@ -893,8 +1018,18 @@ async def run_agent() -> None:
             # 1. Check if there are pending repo posts to process
             has_pending = bool(storage.get_next_pending_repo_task())
             if has_pending:
+                if not storage.can_post_today():
+                    log("📅 Already posted today. Sleeping 1 hour before next check...")
+                    await asyncio.sleep(AGENT_CYCLE_INTERVAL_SECONDS)
+                    continue
+
                 log("📋 Processing next repo post from todo list...")
-                await process_next_repo_post()
+                outcome = await process_next_repo_post()
+
+                if outcome == "approved":
+                    # Ask whether the user wants additional posts for today
+                    await _offer_more_posts()
+
                 await asyncio.sleep(RETRY_DELAY_SECONDS)
                 continue
 
