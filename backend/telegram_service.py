@@ -7,7 +7,7 @@ from collections.abc import Callable, Coroutine
 from typing import Any
 
 from telegram import Bot, Update
-from telegram.error import TelegramError
+from telegram.error import BadRequest, TelegramError
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
 from telegram.request import HTTPXRequest
 
@@ -59,7 +59,10 @@ async def send_message(text: str, chat_id: str | None = None) -> bool:
     """Send a plain text message to the configured chat.
 
     If Telegram is unreachable, the message is queued and will be sent once
-    the connection is restored.
+    the connection is restored.  Markdown parse errors are handled by falling
+    back to plain text for the affected chunk so that a formatting mistake in
+    generated content never causes the message to be queued for infinite retry.
+    Only the unsent portion is queued on a transient network failure.
     """
     if not TELEGRAM_BOT_TOKEN:
         logger.warning("TELEGRAM_BOT_TOKEN not set, skipping Telegram message.")
@@ -68,21 +71,48 @@ async def send_message(text: str, chat_id: str | None = None) -> bool:
     if not target:
         logger.warning("TELEGRAM_CHAT_ID not set, skipping Telegram message.")
         return False
+
     try:
         req = _make_request()
         bot = Bot(token=TELEGRAM_BOT_TOKEN, request=req) if req else Bot(token=TELEGRAM_BOT_TOKEN)
-        # Telegram max message length is 4096
-        for chunk in _split_text(text, TELEGRAM_MESSAGE_CHUNK_SIZE):
-            await bot.send_message(chat_id=target, text=chunk, parse_mode="Markdown")
-        return True
-    except TelegramError as exc:
-        logger.error("Telegram send error: %s — queuing message for retry.", exc)
-        _queue_pending_message(text)
-        return False
     except Exception as exc:
-        logger.error("Unexpected error sending Telegram message: %s — queuing for retry.", exc)
+        logger.error("Failed to create Telegram bot: %s — queuing message for retry.", exc)
         _queue_pending_message(text)
         return False
+
+    chunks = _split_text(text, TELEGRAM_MESSAGE_CHUNK_SIZE)
+    for i, chunk in enumerate(chunks):
+        remainder = "\n".join(chunks[i:])
+        try:
+            await bot.send_message(chat_id=target, text=chunk, parse_mode="Markdown")
+        except BadRequest as md_exc:
+            # Markdown parsing failed — log and retry this chunk as plain text.
+            logger.warning("Markdown parse error for chunk %d/%d: %s — retrying as plain text.", i + 1, len(chunks), md_exc)
+            try:
+                await bot.send_message(chat_id=target, text=chunk)
+            except TelegramError as exc:
+                logger.error(
+                    "Telegram send error (plain text fallback): %s — queuing remainder for retry.", exc
+                )
+                _queue_pending_message(remainder)
+                return False
+            except Exception as exc:
+                logger.error(
+                    "Unexpected error (plain text fallback): %s — queuing remainder for retry.", exc
+                )
+                _queue_pending_message(remainder)
+                return False
+        except TelegramError as exc:
+            logger.error("Telegram send error: %s — queuing remainder for retry.", exc)
+            _queue_pending_message(remainder)
+            return False
+        except Exception as exc:
+            logger.error(
+                "Unexpected error sending Telegram message: %s — queuing remainder for retry.", exc
+            )
+            _queue_pending_message(remainder)
+            return False
+    return True
 
 
 def _queue_pending_message(text: str) -> None:
@@ -95,25 +125,37 @@ def _queue_pending_message(text: str) -> None:
 
 
 async def flush_pending_messages() -> int:
-    """Try to send all queued pending messages.  Returns the number successfully sent."""
+    """Try to send all queued pending messages.  Returns the number successfully sent.
+
+    A snapshot of the queue is taken before flushing so that any messages
+    enqueued concurrently (e.g. from the main agent loop during an ``await``)
+    are not accidentally discarded when the snapshot's remainder is written back.
+    """
     global _pending_messages
     if not _pending_messages:
         return 0
 
+    # Snapshot the current queue and reset the live list so that messages
+    # produced during the flush accumulate in the fresh list.
+    snapshot = _pending_messages
+    _pending_messages = []
+
     sent_count = 0
-    remaining: list[str] = []
-    for i, msg in enumerate(_pending_messages):
+    failed_idx: int | None = None
+    for i, msg in enumerate(snapshot):
         ok = await _send_direct(msg)
         if ok:
             sent_count += 1
         else:
-            # Telegram still down — stop attempting and carry over this and all remaining messages
-            remaining = _pending_messages[i:]
+            # Telegram still down — stop attempting; carry over this and all remaining.
+            failed_idx = i
             break
 
-    _pending_messages = remaining
+    unsent_from_snapshot = snapshot[failed_idx:] if failed_idx is not None else []
+    # Combine unsent snapshot messages with any new messages added during the flush.
+    _pending_messages = unsent_from_snapshot + _pending_messages
     try:
-        storage.save_pending_messages(remaining)
+        storage.save_pending_messages(_pending_messages)
     except Exception as exc:
         logger.warning("Could not update persisted pending messages: %s", exc)
 
@@ -123,7 +165,11 @@ async def flush_pending_messages() -> int:
 
 
 async def _send_direct(text: str, chat_id: str | None = None) -> bool:
-    """Low-level send that does NOT queue on failure (used for flush retries)."""
+    """Low-level send that does NOT queue on failure (used for flush retries).
+
+    Falls back to plain text if Markdown parsing fails, so that messages with
+    malformed Markdown are not silently dropped on every flush attempt.
+    """
     if not TELEGRAM_BOT_TOKEN:
         return False
     target = chat_id or TELEGRAM_CHAT_ID
@@ -133,7 +179,12 @@ async def _send_direct(text: str, chat_id: str | None = None) -> bool:
         req = _make_request()
         bot = Bot(token=TELEGRAM_BOT_TOKEN, request=req) if req else Bot(token=TELEGRAM_BOT_TOKEN)
         for chunk in _split_text(text, TELEGRAM_MESSAGE_CHUNK_SIZE):
-            await bot.send_message(chat_id=target, text=chunk, parse_mode="Markdown")
+            try:
+                await bot.send_message(chat_id=target, text=chunk, parse_mode="Markdown")
+            except BadRequest as md_exc:
+                # Markdown parsing failed — log and retry as plain text.
+                logger.debug("Markdown parse error during flush: %s — retrying as plain text.", md_exc)
+                await bot.send_message(chat_id=target, text=chunk)
         return True
     except Exception as exc:
         logger.debug("Flush send attempt failed: %s", exc)
