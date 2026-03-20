@@ -302,6 +302,7 @@ async def process_next_repo_post() -> str:
 
     elif action == "timeout":
         log("⏰ No response from user. Skipping post for now.")
+        storage.complete_todo(task["id"])
         return "timeout"
 
     return "rejected"
