@@ -36,7 +36,7 @@
 - <a href="#features">✨ Features</a>
 - <a href="#architecture">🏗️ Architecture</a>
 - <a href="#tech-stack">🛠 Tech Stack</a>
-- <a href="#dependencies-packages">📦 Dependencies & Packages</a>
+- <a href="#dependencies-and-packages">📦 Dependencies and Packages</a>
 - <a href="#prerequisites">📋 Prerequisites</a>
 - <a href="#installation">⚙️ Installation</a>
 - <a href="#quick-start">🚀 Quick Start</a>
@@ -56,7 +56,7 @@
 3. <a href="#features">Features</a>
 4. <a href="#architecture">Architecture</a>
 5. <a href="#tech-stack">Tech Stack</a>
-6. <a href="#dependencies-packages">Dependencies & Packages</a>
+6. <a href="#dependencies-and-packages">Dependencies and Packages</a>
 7. <a href="#prerequisites">Prerequisites</a>
 8. <a href="#installation">Installation</a>
 9. <a href="#quick-start">Quick Start</a>
@@ -75,6 +75,7 @@ This repository hosts **H0NEYP0T-466/linkedin-agent**, an intelligent automation
 
 ## Key Highlights
 
+<a id="key-highlights"></a>
 This project is an **autonomous LinkedIn Agent** that monitors GitHub repositories, generates AI-powered content, and manages a real-time terminal interface. 🤖 The system combines web scraping, LLM integration, and Telegram notifications to create a seamless content pipeline for tech professionals.
 
 Key capabilities include: **real-time log streaming** via WebSocket connections, **RSS feed monitoring** for AI/ML news, and **GitHub activity tracking** with README parsing. The agent uses LongCat's OpenAI-compatible API to generate LinkedIn posts from repository data, with approval workflows handled through Telegram bot integration.
@@ -127,8 +128,9 @@ The backend leverages **FastAPI** for high-performance API endpoints, async HTTP
 
 The frontend is a **React** application powered by **Vite** for fast development, featuring a terminal-style UI with real-time log streaming and interactive command-line aesthetics. It communicates with the backend via REST APIs and WebSocket connections for live updates.
 
-## Dependencies & Packages
+## Dependencies and Packages
 
+<a id="dependencies-and-packages"></a>
 The project relies on several key dependencies defined in two main files: `backend/requirements.txt` for the Python backend and `package.json` (with `package-lock.json`) for the React frontend.
 
 **Backend Dependencies (Python)** – Defined in `backend/requirements.txt`:  
@@ -169,6 +171,8 @@ Before setting up the **H0NEYP0T-466/linkedin-agent**, ensure your system meets 
 This project requires both **Python 3.9+** for the backend and **Node.js 18+** with npm for the frontend.
 
 ### Backend Setup
+
+<a id="backend-setup"></a>
 1. Navigate to the `backend` directory
 2. Create a virtual environment:  
    ```bash
@@ -181,6 +185,8 @@ This project requires both **Python 3.9+** for the backend and **Node.js 18+** w
    ```
 
 ### Frontend Setup
+
+<a id="frontend-setup"></a>
 1. Ensure you're in the project root
 2. Install frontend dependencies:  
    ```bash
@@ -188,6 +194,8 @@ This project requires both **Python 3.9+** for the backend and **Node.js 18+** w
    ```
 
 ### Running the Application
+
+<a id="running-the-application"></a>
 - Start the backend server:  
   ```bash
   cd backend && uvicorn main:app --host 0.0.0.0 --port 8006 --reload
@@ -236,6 +244,7 @@ Key interactions include starting/stopping the agent, viewing current tasks, che
 
 ## API Endpoints
 
+<a id="api-endpoints"></a>
 The FastAPI backend exposes several RESTful endpoints and WebSocket connections for managing the LinkedIn Agent's lifecycle and retrieving data:
 
 - **`POST /agent/start`** — Initiates the agent's autonomous workflow, triggering GitHub repository monitoring, AI-powered post generation, and Telegram-based approval notifications.
@@ -248,6 +257,7 @@ These endpoints support CORS-enabled communication with the React frontend runni
 
 ## Configuration
 
+<a id="configuration"></a>
 The LinkedIn Agent is configured primarily through environment variables that control core functionality across its modular services. The system uses a centralized configuration approach where critical parameters are loaded from the environment during runtime.
 
 Key configuration areas include:
@@ -263,36 +273,93 @@ For local development, create a `.env` file in the `backend/` directory with the
 
 ## Environment Variables
 
-The LinkedIn Agent backend relies on several environment variables to configure its behavior and integrations. These include:
+<a id="environment-variables"></a>
+The LinkedIn Agent backend relies on several environment variables to configure its behavior and integrations. These should be set in your environment or a `.env` file in the `backend/` directory.
 
-- `TELEGRAM_BOT_TOKEN`: Required for the Telegram bot service to authenticate and send notifications.
-- `LLM_API_KEY`: Needed for the LLM service to access the LongCat OpenAI-format API for content generation.
-- `GITHUB_USERNAME`: Specifies the GitHub user whose repositories are monitored by the GitHub service.
-- `CLOUDFLARE_TOKEN`: Optional, used by the scraper service to bypass Cloudflare protection on JavaScript-heavy pages.
-- `PORT`: Defines the port on which the FastAPI server runs (default: 8006).
+### Required Variables
 
-These variables should be set in your environment or a `.env` file before running the application. The backend uses these values to initialize services like Telegram messaging, AI content generation, and data scraping.
+<a id="required-variables"></a>
+- `TELEGRAM_BOT_TOKEN`: Your bot token from @BotFather for Telegram bot authentication
+- `TELEGRAM_CHAT_ID`: Your personal chat ID (send `/start` to the bot to get this)
+- `LONGCAT_API_KEY` or `OPENAI_API_KEY`: API key for the LLM service (LongCat OpenAI-compatible API)
+- `GITHUB_USERNAME`: GitHub username to monitor for repository activity
+
+### Optional Variables
+
+<a id="optional-variables"></a>
+- `TELEGRAM_PROXY`: HTTP/SOCKS5 proxy URL if Telegram is blocked in your region
+- `LLM_MODEL`: Model name to use (default: `longcat-flash-lite`)
+- `LONGCAT_BASE_URL`: Base URL for OpenAI-compatible endpoint (default: `https://api.longcat.chat/openai`)
+- `LLM_TIMEOUT_SECONDS`: Request timeout in seconds (default: 60)
+- `DATA_DIR`: Directory for all agent data (default: `./data`)
+- `REPOS_DIR`: Directory where repos are cloned (default: `DATA_DIR/repos`)
+- `PORT`: Server port (default: 8006)
+- `CLOUDFLARE_API_TOKEN`: For Cloudflare browser rendering of JS-heavy pages
+- `CLOUDFLARE_ACCOUNT_ID`: Cloudflare account ID for browser rendering
+
+See `backend/.env.example` for a complete template with all available configuration options.
 
 ## Project Structure
 
+<a id="project-structure"></a>
 The project follows a **monorepo** structure with clear separation between frontend and backend components:
 
-- **Frontend (`src/`)**: Built with React and Vite, featuring a terminal-style UI for real-time agent monitoring
-  - `App.tsx` - Main React component handling WebSocket connections and log streaming
-  - `main.tsx` - Application entry point with StrictMode wrapper
-  - `App.css` & `index.css` - Terminal-inspired styling with dark theme and green monospace text
+### Backend (`backend/`)
 
-- **Backend (`backend/`)**: FastAPI-based microservices architecture
-  - `main.py` - Core API server with WebSocket support and CORS configuration
-  - `agent.py` - Orchestrates all services within an async event loop
-  - `llm_service.py` - Handles LLM interactions via LongCat OpenAI-format API
-  - `scraper_service.py` - Fetches AI/ML/tech news from RSS feeds
-  - `github_service.py` - Manages GitHub repository data and user events
-  - `telegram_service.py` - Telegram bot integration with message queuing
-  - `storage.py` - JSON/Markdown-based persistent storage system
+<a id="backend"></a>
+FastAPI-based microservices architecture with async/await patterns:
+- `main.py` - Core API server with WebSocket support and CORS configuration
+- `agent.py` - Orchestrates all services within an async event loop
+- `llm_service.py` - Handles LLM interactions via LongCat OpenAI-format API
+- `scraper_service.py` - Fetches AI/ML/tech news from RSS feeds with Cloudflare support
+- `github_service.py` - Manages GitHub repository data, commits, and user events
+- `telegram_service.py` - Telegram bot integration with message queuing and approval workflows
+- `storage.py` - JSON/Markdown-based persistent storage system for logs, repos, and posts
+- `requirements.txt` - Python dependencies (FastAPI, Uvicorn, httpx, python-telegram-bot, BeautifulSoup4, GitPython, pydantic, feedparser, aiofiles)
+- `run_commands.txt` - Useful commands and scripts for development and deployment
+- `data/` - Persistent data directory containing:
+  - `pending_messages.json` - Queued Telegram messages awaiting delivery
+  - `repos.json` - Tracked GitHub repositories and metadata
+  - `repos.md` - Repository documentation in Markdown format
+  - `state.json` - Agent runtime state and progress tracking
+  - `todo.json` - Task queue for autonomous operations
+  - `memory.md` - Project memory and context notes
+  - `posts/` - Generated LinkedIn post drafts organized by status:
+    - `approved/` - Posts approved via Telegram bot workflow
+    - Pending posts awaiting approval
+  - `repos/` - Cloned GitHub repository copies with README files for analysis
+- `.env.example` - Environment variable template with all required configuration
 
-- **Configuration**: TypeScript configs (`tsconfig.*.json`), ESLint setup, and Vite build tooling
-- **Root files**: Package manifests, dependency locks, and HTML entry point
+### Frontend (`src/`)
+
+<a id="frontend"></a>
+Built with React 19 and Vite, featuring a terminal-style UI:
+- `App.tsx` - Main React component handling WebSocket connections and real-time log streaming
+- `main.tsx` - Application entry point with StrictMode wrapper
+- `App.css` & `index.css` - Terminal-inspired styling with dark theme and green monospace text
+- `assets/` - Static assets and images
+
+### Configuration (Root Level)
+
+<a id="configuration-root-level"></a>
+TypeScript configs, ESLint setup, and build tooling:
+- `package.json` & `package-lock.json` - Frontend dependencies and scripts
+- `tsconfig.json`, `tsconfig.app.json`, `tsconfig.node.json` - TypeScript compiler configurations
+- `vite.config.ts` - Vite build tool and development server configuration
+- `eslint.config.js` - Code quality and style enforcement rules
+- `index.html` - HTML entry point with WebSocket connection setup
+- `public/` - Static assets served directly by the web server
+
+### Documentation & Governance
+
+<a id="documentation-governance"></a>
+- `README.md` - Project overview and usage instructions
+- `LICENSE` - MIT License terms
+- `CONTRIBUTING.md` - Guidelines for contributors
+- `SECURITY.md` - Security policies and reporting procedures
+- `CODE_OF_CONDUCT.md` - Community standards
+- `SUPPORT.md` - Support resources and troubleshooting
+- `you.txt` - Additional project notes and information
 
 ## License
 
