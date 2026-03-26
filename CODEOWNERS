@@ -1,0 +1,17 @@
+# CODEOWNERS
+# Default owner for all files
+* @H0NEYP0T-466
+
+# Backend Python services and configuration
+backend/ @H0NEYP0T-466
+
+# Frontend React application
+src/ @H0NEYP0T-466
+
+# Configuration files
+*.json @H0NEYP0T-466
+*.ts @H0NEYP0T-466
+*.tsx @H0NEYP0T-466
+*.js @H0NEYP0T-466
+*.css @H0NEYP0T-466
+*.html @H0NEYP0T-466
